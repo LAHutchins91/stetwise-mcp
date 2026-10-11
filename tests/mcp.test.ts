@@ -228,11 +228,37 @@ describe("MCP", () => {
     delete process.env.STETWISE_CAP_TRIAL_RECALCS;
   });
 
+  it("counts inspect, read, and search toward the read cap", async () => {
+    await getStore().replaceUsage(DEV_USER_ID, { reads: 0 });
+    const original = fs.readFileSync(path.join(repoRoot(), "tests/fixtures/generated/model.xlsx"));
+    const fileId = await upload("model.xlsx", original);
+    process.env.STETWISE_CAP_TRIAL_READS = "2";
+    try {
+      expect((await call("inspect", { file_id: fileId })).isError).toBe(false);
+      expect((await call("read", { file_id: fileId, sheet: "Inputs", range: "A1:A3" })).isError).toBe(false);
+      const blocked = await call("search", { file_id: fileId, query: "Note" });
+      expect(blocked.isError).toBe(true);
+      expect(JSON.stringify(blocked.data)).toContain("reads");
+      const usage = await call("get_usage", {});
+      expect((usage.data.reads as { used: number }).used).toBe(2);
+    } finally {
+      delete process.env.STETWISE_CAP_TRIAL_READS;
+    }
+  });
+
   it("counts a recalculation when LibreOffice starts and leaves no soffice behind", async () => {
     const store = getStore();
     await store.replaceUsage(DEV_USER_ID, { recalculations: 0, proposals: 0 });
     const original = fs.readFileSync(path.join(repoRoot(), "tests/fixtures/generated/model.xlsx"));
     const fileId = await upload("model.xlsx", original);
+    const profiles = () =>
+      new Set(
+        execFileSync("bash", ["-lc", "ls -d /tmp/stetwise-lo-* 2>/dev/null || true"], { encoding: "utf8" })
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+      );
+    const beforeProfiles = profiles();
     process.env.STETWISE_RECALC_TIMEOUT = "1";
     process.env.STETWISE_RECALC_HOLD = "12";
     try {
@@ -257,6 +283,8 @@ describe("MCP", () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     expect(left).toBe("");
+    const created = [...profiles()].filter((name) => !beforeProfiles.has(name));
+    expect(created).toEqual([]);
   });
 
   it("creates a blank workbook and fills it through propose and apply", async () => {

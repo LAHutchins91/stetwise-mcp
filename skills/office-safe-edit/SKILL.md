@@ -20,15 +20,15 @@ On a hosted account the PUT goes to a Supabase signed URL, and the PUT response 
 ## Edit
 
 1. `inspect`, then `read` or `search`.
-2. `propose_edit` with one file and the smallest operation that does the job. Show the diff and the warnings. One proposal can cover at most 5000 cells. `clear_range` and `fill_range` edit a rectangle. `format_cells` can set font size, font colour, and a thin border. `insert_paragraph` can use a paragraph style that is already in the document, and will not create a style.
+2. `propose_edit` with one file and the smallest operation that does the job. Show the diff and the warnings. One proposal can cover at most 5000 cells. `clear_range` and `fill_range` edit a rectangle. `format_cells` can set font size, font colour, and a thin border. `format_runs` can set bold, italic, underline, font size, and font colour on the matched run, and does not edit styles. `insert_paragraph` can use a paragraph style that is already in the document, including Heading 1–3 and the bullet or number list styles on a new document, and will not create a style.
 3. `apply_edit` with that `proposal_id` and the `base_version` token. A stale token means the file moved. Propose again. Do not reuse an old token.
 4. `export` returns a short-lived download link. `restore_version` undoes by creating a new head equal to an earlier version.
 
-`recalculate` runs LibreOffice on a copy and returns a preview of cached values. Dates and currency stay numbers. Apply that proposal to keep them. Do not invent cached values. A run counts when LibreOffice starts. `create_file` makes a blank workbook or document; fill it with `propose_edit`.
+`recalculate` runs LibreOffice's Calc engine on a copy and returns a preview of cached values. Results may differ from Excel on edge cases. Dates and currency stay numbers. Apply that proposal to keep them. Do not invent cached values. A run counts when LibreOffice starts. `create_file` makes a blank workbook or document; fill it with `propose_edit`.
 
 ## Caps and retention
 
-`get_usage` shows the monthly counters for edits, files, recalculations, and proposals. Each started 5 MB of a file counts as one unit. Past a cap, stop. Stetwise does not bill overage. Files expire 24 hours after last use unless the user sets 168 hours with `set_retention`.
+`get_usage` shows the monthly counters for edits, files, recalculations, proposals, and reads. `inspect`, `read`, `search`, `list_versions`, and `diff_versions` count toward the read cap. Each started 5 MB of a file counts as one unit. Past a cap, stop. Stetwise does not bill overage. Files expire 24 hours after last use unless the user sets 168 hours with `set_retention`.
 
 ## Refusals
 

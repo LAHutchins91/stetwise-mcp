@@ -70,7 +70,7 @@ See `.env.example`. Names only:
 | `OPENAI_APPS_CHALLENGE` | Optional ChatGPT domain check. |
 | `PORT` | Node HTTP port, default `3000`. The engine reads the same variable and defaults to `8080`. |
 
-Checkout sends `line_items[0][price]` set to `STRIPE_PRICE_MONTHLY` or `STRIPE_PRICE_YEARLY`. It sets `subscription_data[trial_period_days]` to 14. It does not create a product or a price, and it does not send an amount. Stripe shows the amount. While `subscription_status` is `trialing`, the server enforces the trial caps below (100 applied edits, 20 recalculations, and 200 proposals), even if the Stripe plan name is already Pro. An `active` subscription uses the Pro caps. Past a cap the call is blocked. There is no overage charge.
+Checkout sends `line_items[0][price]` set to `STRIPE_PRICE_MONTHLY` or `STRIPE_PRICE_YEARLY`. It sets `subscription_data[trial_period_days]` to 14. It does not create a product or a price, and it does not send an amount. Stripe shows the amount. While `subscription_status` is `trialing`, the server enforces the trial caps below (100 applied edits, 20 recalculations, 200 proposals, and 200 reads), even if the Stripe plan name is already Pro. An `active` subscription uses the Pro caps. Past a cap the call is blocked. There is no overage charge.
 
 Monthly caps, overridable without a code change:
 
@@ -78,18 +78,20 @@ Monthly caps, overridable without a code change:
 |---|---|
 | `STETWISE_CAP_PRO_EDITS` | 1000 |
 | `STETWISE_CAP_PRO_FILES` | 250 |
-| `STETWISE_CAP_PRO_RECALCS` | 100 |
+| `STETWISE_CAP_PRO_RECALCS` | 200 |
 | `STETWISE_CAP_PRO_PROPOSALS` | 2000 |
+| `STETWISE_CAP_PRO_READS` | 1000 |
 | `STETWISE_CAP_PRO_MAX_BYTES` | 26214400 (25 × 1024 × 1024) |
 | `STETWISE_CAP_TRIAL_EDITS` | 100 |
 | `STETWISE_CAP_TRIAL_FILES` | 25 |
 | `STETWISE_CAP_TRIAL_RECALCS` | 20 |
 | `STETWISE_CAP_TRIAL_PROPOSALS` | 200 |
+| `STETWISE_CAP_TRIAL_READS` | 200 |
 | `STETWISE_CAP_TRIAL_MAX_BYTES` | 26214400 |
 | `STETWISE_HEAD_CACHE_BYTES` | 67108864 |
 | `STETWISE_RECALC_TIMEOUT` | 60 seconds |
 
-Each started 5 MB of a file counts as one unit toward files, applied edits, recalculations, and proposals. A 25 MB file counts as 5. A call that would pass the cap is blocked entirely. Trial file cap defaults to 25 new files per UTC month. Pro is 250. A trialing subscription uses the trial caps. An active subscription uses the Pro caps, including a yearly plan. Counters are per user and per UTC month. Deleting a file does not refund that month's file count. Restore does not count as an applied edit. A recalculation counts when LibreOffice starts, whether it finishes or not. A refusal before LibreOffice starts (not a workbook, no formulas, or LibreOffice is missing) does not count. A proposal counts when it is saved. An unchanged recalculation does not save a proposal.
+Each started 5 MB of a file counts as one unit toward files, applied edits, recalculations, proposals, and reads. A 25 MB file counts as 5. A call that would pass the cap is blocked entirely. Trial file cap defaults to 25 new files per UTC month. Pro is 250. Trial reads default to 200 units per UTC month. Pro reads default to 1,000. A trialing subscription uses the trial caps. An active subscription uses the Pro caps, including a yearly plan. Counters are per user and per UTC month. Deleting a file does not refund that month's file count. Restore does not count as an applied edit. A recalculation counts when LibreOffice starts, whether it finishes or not. A refusal before LibreOffice starts (not a workbook, no formulas, or LibreOffice is missing) does not count. A proposal counts when it is saved. An unchanged recalculation does not save a proposal. `inspect`, `read`, `search`, `list_versions`, and `diff_versions` each count as one read of that file's units when the call succeeds.
 
 Files expire 24 hours after last use. `set_retention` accepts 24 or 168 (7 days). `POST /internal/purge` with header `x-stetwise-purge` deletes expired rows and unreferenced blobs. `GET /internal/purge` with `Authorization: Bearer $CRON_SECRET` does the same call for Vercel Cron. Objects under `incoming/` and `stage/` younger than 2 hours are left in place. The route does not create cloud resources by itself.
 
@@ -134,10 +136,10 @@ Do not deploy from this repository. Do not create Stripe products or prices. Che
 ## What works in v1
 
 - Inspect, read a range or section, and search `.xlsx`, `.xlsm`, and `.docx`.
-- `propose_edit` then `apply_edit` for `set_cells` (including Excel table body cells and shared formulas), `clear_range`, `fill_range`, `insert_rows`, `insert_cols`, Excel `replace_text` on text values, `format_cells` (number format, bold, italic, fill, alignment, column width, font size, font colour, and a thin border), Word `replace_text`, `replace_paragraph`, `update_table_cells`, `insert_paragraph` (including a paragraph style already defined in the document), `delete_paragraph`, and `format_runs`. One proposal can touch at most 5000 cells.
+- `propose_edit` then `apply_edit` for `set_cells` (including Excel table body cells and shared formulas), `clear_range`, `fill_range`, `insert_rows`, `insert_cols`, Excel `replace_text` on text values, `format_cells` (number format, bold, italic, fill, alignment, column width, font size, font colour, and a thin border), Word `replace_text`, `replace_paragraph`, `update_table_cells`, `insert_paragraph` (including a paragraph style already defined in the document, such as Heading 1–3 or a list style on a new document), `delete_paragraph`, and `format_runs` (bold, italic, underline, font size, and font colour on the run only). One proposal can touch at most 5000 cells.
 - `create_file` for a blank `.xlsx` or `.docx`, then the same propose and apply flow.
 - `list_comments` to read Word comments without changing the file.
-- `recalculate` runs LibreOffice on a copy and previews cached formula values. Dates, currency, and percents stay numbers. Booleans, errors, and strings keep their own cell types. Apply that proposal to keep them. Undo restores the previous bytes. The current head is cached between propose and apply, and dropped when the file expires or is deleted.
+- `recalculate` runs LibreOffice's Calc engine on a copy and previews cached formula values. Results may differ from Excel on edge cases. Dates, currency, and percents stay numbers. Booleans, errors, and strings keep their own cell types. A LibreOffice error that is not an Excel error value is refused, and nothing is written. Apply that proposal to keep the cached values. Undo restores the previous bytes. The current head is cached between propose and apply, and dropped when the file expires or is deleted.
 - Word edits are direct when tracking is off. Pass `track_changes: true`, or edit a document that already has tracking on, and the same change is written as `w:ins` / `w:del` by Stetwise.
 - Versions, undo, and a signed download link.
 - ChatGPT file import (`import_file`) and a signed upload link for other clients. Hosted clients call `complete_upload` after the PUT.

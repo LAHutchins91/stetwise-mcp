@@ -576,7 +576,7 @@ def update_table_cells_tracked(package, table: int, cells: list[dict], requested
     )
 
 
-def format_runs(package, find: str, bold, italic, underline, occurrence: int | None):
+def format_runs(package, find: str, bold, italic, underline, occurrence: int | None, font_size=None, font_color=None):
     from .docx import EditResult, _document, _ensure_text_index, _global_t_index, _paragraphs, _visible_runs, protected
     from .xmlutil import parse_xml, word_text_spans
 
@@ -584,8 +584,10 @@ def format_runs(package, find: str, bold, italic, underline, occurrence: int | N
         raise StetwiseRefusal("This document is protected. v1 will not bypass document protection.", "protected")
     if not find:
         raise StetwiseRefusal("The text to format is empty.", "empty_query")
-    if bold is None and italic is None and underline is None:
-        raise StetwiseRefusal("format_runs needs bold, italic, or underline.", "empty_edit")
+    half = _font_half_points(font_size)
+    color = _font_color(font_color)
+    if bold is None and italic is None and underline is None and half is None and color is None:
+        raise StetwiseRefusal("format_runs needs bold, italic, underline, font size, or font colour.", "empty_edit")
     xml = _document(package)
     root = parse_xml(xml, "word/document.xml")
     _ensure_text_index(xml, root)
@@ -645,13 +647,13 @@ def format_runs(package, find: str, bold, italic, underline, occurrence: int | N
                 )
             used_runs.add(run_span)
             run = xml[run_span[0] : run_span[1]]
-            edits.append((run_span[0], run_span[1], _render_format(run, segments, bold, italic, underline, ids, when, tracked)))
+            edits.append((run_span[0], run_span[1], _render_format(run, segments, bold, italic, underline, half, color, ids, when, tracked)))
     if not applied:
         raise StetwiseRefusal(f"No occurrences of {find!r} were found in the document body.", "not_found")
     out = xml
     for start, end, blob in sorted(edits, key=lambda item: item[0], reverse=True):
         out = out[:start] + blob + out[end:]
-    flags = {"bold": bold, "italic": italic, "underline": underline}
+    flags = {"bold": bold, "italic": italic, "underline": underline, "font_size": font_size, "font_color": color}
     return EditResult(
         replacements={"word/document.xml": out},
         diff=[{"op": "format_runs", "changes": applied, "format": {key: value for key, value in flags.items() if value is not None}}],
@@ -686,9 +688,31 @@ def _format_segments(piece: dict, spans: list[tuple[int, int]]) -> list[tuple[st
     return segments if touched else None
 
 
-def _render_format(run: bytes, segments: list[tuple[str, str]], bold, italic, underline, ids: _Ids, when: str, tracked: bool) -> bytes:
+def _font_half_points(font_size) -> int | None:
+    if font_size is None:
+        return None
+    try:
+        points = float(font_size)
+    except (TypeError, ValueError):
+        points = -1
+    half = int(round(points * 2))
+    if not (points > 0 and points <= 409 and half >= 1):
+        raise StetwiseRefusal("Font size must be greater than 0 and at most 409.", "bad_format")
+    return half
+
+
+def _font_color(font_color) -> str | None:
+    if font_color is None:
+        return None
+    text = str(font_color)
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", text):
+        raise StetwiseRefusal("Font colour must be six hex digits, RRGGBB.", "bad_format")
+    return text.upper()
+
+
+def _render_format(run: bytes, segments: list[tuple[str, str]], bold, italic, underline, half, color, ids: _Ids, when: str, tracked: bool) -> bytes:
     rpr = _rpr(run)
-    formatted = _flags(rpr, bold, italic, underline)
+    formatted = _flags(rpr, bold, italic, underline, half, color)
     if tracked:
         previous = rpr or b"<w:rPr/>"
         change = f'<w:rPrChange w:id="{ids.next()}" w:author="{W_AUTHOR}" w:date="{when}">'.encode() + previous + b"</w:rPrChange>"
@@ -701,7 +725,7 @@ def _render_format(run: bytes, segments: list[tuple[str, str]], bold, italic, un
     return b"".join(out)
 
 
-def _flags(rpr: bytes, bold, italic, underline) -> bytes:
+def _flags(rpr: bytes, bold, italic, underline, half: int | None = None, color: str | None = None) -> bytes:
     if not rpr:
         rpr = b"<w:rPr></w:rPr>"
     elif rpr.endswith(b"/>"):
@@ -723,4 +747,10 @@ def _flags(rpr: bytes, bold, italic, underline) -> bytes:
         extra += b'<w:u w:val="single"/>'
     elif underline is False:
         extra += b'<w:u w:val="none"/>'
+    if half is not None:
+        rpr = strip(strip(rpr, "sz"), "szCs")
+        extra += f'<w:sz w:val="{half}"/><w:szCs w:val="{half}"/>'.encode("ascii")
+    if color is not None:
+        rpr = strip(rpr, "color")
+        extra += f'<w:color w:val="{color}"/>'.encode("ascii")
     return rpr.replace(b"</w:rPr>", extra + b"</w:rPr>", 1)

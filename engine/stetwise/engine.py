@@ -193,6 +193,10 @@ def _one(package, kind: str, op: dict):
         if name == "delete_paragraph":
             return docx.delete_paragraph(package, op.get("anchor") or "", track_changes=_track(op))
         if name == "format_runs":
+            color = op.get("font_color")
+            colour = op.get("font_colour")
+            if color is not None and colour is not None and str(color).lower() != str(colour).lower():
+                raise StetwiseRefusal("font_color and font_colour do not match.", "bad_format")
             return docx.format_runs(
                 package,
                 op.get("find") or "",
@@ -200,6 +204,8 @@ def _one(package, kind: str, op: dict):
                 italic=op.get("italic"),
                 underline=op.get("underline"),
                 occurrence=op.get("occurrence"),
+                font_size=op.get("font_size"),
+                font_color=None if color is None and colour is None else (color if color is not None else colour),
             )
         if name in {"set_cells", "insert_rows", "insert_cols", "format_cells", "clear_range", "fill_range"}:
             raise StetwiseRefusal(f"{name} is an Excel operation and this file is a Word document.", "wrong_kind")

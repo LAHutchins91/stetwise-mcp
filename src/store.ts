@@ -162,6 +162,8 @@ export interface Store {
   publishEdit(ownerId: string, proposalId: string, baseVersion: string, now?: Date): Promise<PublishResult>;
   recordRecalculation(ownerId: string, now?: Date, sizeBytes?: number): Promise<ReturnType<typeof usageView>>;
   assertRecalcAllowed(ownerId: string, now?: Date, sizeBytes?: number): Promise<void>;
+  recordRead(ownerId: string, now?: Date, sizeBytes?: number): Promise<ReturnType<typeof usageView>>;
+  assertReadAllowed(ownerId: string, now?: Date, sizeBytes?: number): Promise<void>;
   restore(ownerId: string, fileId: string, version: number, now?: Date): Promise<PublishResult>;
   deleteFile(ownerId: string, fileId: string): Promise<void>;
   deleteAll(ownerId: string): Promise<number>;
@@ -244,7 +246,7 @@ function cachedBytes(ownerId: string, fileId: string, sha: string, expiresAt: st
 }
 
 function countsOf(state: State, ownerId: string, now: Date): UsageCounts {
-  return state.usage[ownerId]?.[monthKey(now)] ?? emptyUsage();
+  return { ...emptyUsage(), ...(state.usage[ownerId]?.[monthKey(now)] ?? {}) };
 }
 
 function bump(state: State, ownerId: string, metric: UsageMetric, tier: PlanTier, now: Date, units = 1): UsageCounts {
@@ -253,7 +255,7 @@ function bump(state: State, ownerId: string, metric: UsageMetric, tier: PlanTier
   }
   const month = monthKey(now);
   state.usage[ownerId] ??= {};
-  const current = state.usage[ownerId][month] ?? emptyUsage();
+  const current = { ...emptyUsage(), ...(state.usage[ownerId][month] ?? {}) };
   const cap = planCaps(tier)[metric];
   if (current[metric] + units > cap) throw new QuotaError(metric, current[metric], cap, tier, now, units);
   current[metric] += units;
@@ -656,6 +658,29 @@ export class LocalStore implements Store {
       const used = countsOf(state, ownerId, now).recalculations;
       const cap = planCaps(tier).recalculations;
       if (used + units > cap) throw new QuotaError("recalculations", used, cap, tier, now, units);
+    });
+  }
+
+  recordRead(ownerId: string, now = new Date(), sizeBytes = 1) {
+    return locked(() => {
+      const state = load();
+      const profile = requireEntitled(state, ownerId);
+      const tier = tierFor(profile);
+      bump(state, ownerId, "reads", tier, now, usageUnits(sizeBytes));
+      save(state);
+      return usageView(tier, countsOf(state, ownerId, now), profile.retention_hours, now);
+    });
+  }
+
+  assertReadAllowed(ownerId: string, now = new Date(), sizeBytes = 1): Promise<void> {
+    return locked(() => {
+      const state = load();
+      const profile = requireEntitled(state, ownerId);
+      const tier = tierFor(profile);
+      const units = usageUnits(sizeBytes);
+      const used = countsOf(state, ownerId, now).reads;
+      const cap = planCaps(tier).reads;
+      if (used + units > cap) throw new QuotaError("reads", used, cap, tier, now, units);
     });
   }
 

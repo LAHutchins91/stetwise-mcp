@@ -29,6 +29,7 @@ create table if not exists public.usage_monthly (
 );
 
 alter table public.usage_monthly add column if not exists proposals integer not null default 0;
+alter table public.usage_monthly add column if not exists reads integer not null default 0;
 
 create table if not exists public.files (
   id uuid primary key,
@@ -151,7 +152,7 @@ begin
 end;
 $$;
 
--- 5 MiB. Each started unit of a file counts as one toward files, edits, recalculations, and proposals.
+-- 5 MiB. Each started unit of a file counts as one toward files, edits, recalculations, proposals, and reads.
 create or replace function public.stetwise_usage_units(p_size integer)
 returns integer
 language sql
@@ -217,6 +218,15 @@ begin
       set proposals = proposals + p_units
       where owner_id = p_owner and month = p_month
       returning proposals into used;
+  elsif p_metric = 'reads' then
+    select reads into used from public.usage_monthly where owner_id = p_owner and month = p_month for update;
+    if used + p_units > p_cap then
+      raise exception 'stetwise:usage_cap:reads:%:%:%', used, p_cap, p_tier using errcode = 'P0001';
+    end if;
+    update public.usage_monthly
+      set reads = reads + p_units
+      where owner_id = p_owner and month = p_month
+      returning reads into used;
   else
     raise exception 'stetwise:bad_metric' using errcode = 'P0001';
   end if;
@@ -412,6 +422,7 @@ declare
   used_files integer;
   used_recalculations integer;
   used_proposals integer;
+  used_reads integer;
 begin
   profile := public.stetwise_lock_profile(p_owner);
   select * into proposal from public.proposals where id = p_proposal for update;
@@ -430,7 +441,7 @@ begin
   end if;
   select coalesce(max(number), 0) into version_number from public.file_versions where file_id = target.id;
   if proposal.applied_at is not null and target.head_sha = proposal.result_sha then
-    select u.edits, u.files, u.recalculations, u.proposals into used_edits, used_files, used_recalculations, used_proposals
+    select u.edits, u.files, u.recalculations, u.proposals, u.reads into used_edits, used_files, used_recalculations, used_proposals, used_reads
       from public.usage_monthly u where u.owner_id = p_owner and u.month = p_month;
     return jsonb_build_object(
       'file_id', target.id,
@@ -442,6 +453,7 @@ begin
       'files', coalesce(used_files, 0),
       'recalculations', coalesce(used_recalculations, 0),
       'proposals', coalesce(used_proposals, 0),
+      'reads', coalesce(used_reads, 0),
       'retention_hours', profile.retention_hours
     );
   end if;
@@ -462,7 +474,7 @@ begin
         expires_at = p_now + make_interval(hours => profile.retention_hours)
     where id = target.id;
   update public.proposals set applied_at = p_now where id = proposal.id;
-  select u.edits, u.files, u.recalculations, u.proposals into used_edits, used_files, used_recalculations, used_proposals
+  select u.edits, u.files, u.recalculations, u.proposals, u.reads into used_edits, used_files, used_recalculations, used_proposals, used_reads
     from public.usage_monthly u where u.owner_id = p_owner and u.month = p_month;
   insert into public.audit_events (owner_id, op, file_id, sha256, size, code)
   values (p_owner, 'apply_edit', target.id, proposal.result_sha, proposal.size, 'ok');
@@ -476,6 +488,7 @@ begin
     'files', used_files,
     'recalculations', used_recalculations,
     'proposals', used_proposals,
+    'reads', used_reads,
     'retention_hours', profile.retention_hours
   );
 end;
@@ -500,6 +513,7 @@ declare
   used_files integer;
   used_recalculations integer;
   used_proposals integer;
+  used_reads integer;
   month_key text;
 begin
   profile := public.stetwise_lock_profile(p_owner);
@@ -524,7 +538,7 @@ begin
         expires_at = p_now + make_interval(hours => profile.retention_hours)
     where id = target.id;
   month_key := to_char(p_now at time zone 'utc', 'YYYY-MM');
-  select u.edits, u.files, u.recalculations, u.proposals into used_edits, used_files, used_recalculations, used_proposals
+  select u.edits, u.files, u.recalculations, u.proposals, u.reads into used_edits, used_files, used_recalculations, used_proposals, used_reads
     from public.usage_monthly u where u.owner_id = p_owner and u.month = month_key;
   insert into public.audit_events (owner_id, op, file_id, sha256, size, code)
   values (p_owner, 'restore_version', target.id, source.sha256, source.size, 'ok');
@@ -538,6 +552,7 @@ begin
     'files', coalesce(used_files, 0),
     'recalculations', coalesce(used_recalculations, 0),
     'proposals', coalesce(used_proposals, 0),
+    'reads', coalesce(used_reads, 0),
     'retention_hours', profile.retention_hours
   );
 end;
@@ -561,16 +576,52 @@ declare
   used_files integer;
   used_recalculations integer;
   used_proposals integer;
+  used_reads integer;
 begin
   perform public.stetwise_lock_profile(p_owner);
   perform public.stetwise_bump(p_owner, p_month, 'recalculations', p_cap, p_tier, p_units);
-  select u.edits, u.files, u.recalculations, u.proposals into used_edits, used_files, used_recalculations, used_proposals
+  select u.edits, u.files, u.recalculations, u.proposals, u.reads into used_edits, used_files, used_recalculations, used_proposals, used_reads
     from public.usage_monthly u where u.owner_id = p_owner and u.month = p_month;
   return jsonb_build_object(
     'edits', used_edits,
     'files', used_files,
     'recalculations', used_recalculations,
-    'proposals', used_proposals
+    'proposals', used_proposals,
+    'reads', used_reads
+  );
+end;
+$$;
+
+drop function if exists public.stetwise_record_read(uuid, text, integer, text, integer);
+
+create or replace function public.stetwise_record_read(
+  p_owner uuid,
+  p_month text,
+  p_cap integer,
+  p_tier text,
+  p_units integer
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  used_edits integer;
+  used_files integer;
+  used_recalculations integer;
+  used_proposals integer;
+  used_reads integer;
+begin
+  perform public.stetwise_lock_profile(p_owner);
+  perform public.stetwise_bump(p_owner, p_month, 'reads', p_cap, p_tier, p_units);
+  select u.edits, u.files, u.recalculations, u.proposals, u.reads into used_edits, used_files, used_recalculations, used_proposals, used_reads
+    from public.usage_monthly u where u.owner_id = p_owner and u.month = p_month;
+  return jsonb_build_object(
+    'edits', used_edits,
+    'files', used_files,
+    'recalculations', used_recalculations,
+    'proposals', used_proposals,
+    'reads', used_reads
   );
 end;
 $$;

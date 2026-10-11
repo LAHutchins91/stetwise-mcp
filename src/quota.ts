@@ -11,13 +11,14 @@ export type PlanTier = "pro" | "trial";
 /** Each started 5 MiB of a file counts as one unit. A 25 MiB file counts as 5. */
 export const USAGE_UNIT_BYTES = 5 * 1024 * 1024;
 
-export type UsageMetric = "edits" | "files" | "recalculations" | "proposals";
+export type UsageMetric = "edits" | "files" | "recalculations" | "proposals" | "reads";
 
 export type PlanCaps = {
   edits: number;
   files: number;
   recalculations: number;
   proposals: number;
+  reads: number;
   maxFileBytes: number;
 };
 
@@ -38,8 +39,9 @@ export function planCaps(tier: PlanTier): PlanCaps {
     return {
       edits: intEnv("STETWISE_CAP_PRO_EDITS", 1000),
       files: intEnv("STETWISE_CAP_PRO_FILES", 250),
-      recalculations: intEnv("STETWISE_CAP_PRO_RECALCS", 100),
+      recalculations: intEnv("STETWISE_CAP_PRO_RECALCS", 200),
       proposals: intEnv("STETWISE_CAP_PRO_PROPOSALS", 2000),
+      reads: intEnv("STETWISE_CAP_PRO_READS", 1000),
       maxFileBytes: intEnv("STETWISE_CAP_PRO_MAX_BYTES", DEFAULT_MAX_FILE_BYTES)
     };
   }
@@ -48,6 +50,7 @@ export function planCaps(tier: PlanTier): PlanCaps {
     files: intEnv("STETWISE_CAP_TRIAL_FILES", 25),
     recalculations: intEnv("STETWISE_CAP_TRIAL_RECALCS", 20),
     proposals: intEnv("STETWISE_CAP_TRIAL_PROPOSALS", 200),
+    reads: intEnv("STETWISE_CAP_TRIAL_READS", 200),
     maxFileBytes: intEnv("STETWISE_CAP_TRIAL_MAX_BYTES", DEFAULT_MAX_FILE_BYTES)
   };
 }
@@ -65,7 +68,8 @@ const METRIC_LABEL: Record<UsageMetric, string> = {
   edits: "applied edits",
   files: "files",
   recalculations: "recalculations",
-  proposals: "proposals"
+  proposals: "proposals",
+  reads: "reads"
 };
 
 export class QuotaError extends ToolError {
@@ -116,7 +120,7 @@ export function expiryFrom(lastUsedAt: string, hours: number): string {
 }
 
 export function emptyUsage(): UsageCounts {
-  return { edits: 0, files: 0, recalculations: 0, proposals: 0 };
+  return { edits: 0, files: 0, recalculations: 0, proposals: 0, reads: 0 };
 }
 
 export function usageView(tier: PlanTier, counts: UsageCounts, retentionHours: number, now = new Date()) {
@@ -135,6 +139,7 @@ export function usageView(tier: PlanTier, counts: UsageCounts, retentionHours: n
     files: metric("files"),
     recalculations: metric("recalculations"),
     proposals: metric("proposals"),
+    reads: metric("reads"),
     resets_at: resetsAt(now),
     overage_billing: false
   };

@@ -167,7 +167,8 @@ function countsFrom(row: Row | null): UsageCounts {
     edits: Number(row.edits ?? 0),
     files: Number(row.files ?? 0),
     recalculations: Number(row.recalculations ?? 0),
-    proposals: Number(row.proposals ?? 0)
+    proposals: Number(row.proposals ?? 0),
+    reads: Number(row.reads ?? 0)
   };
 }
 
@@ -388,7 +389,7 @@ export class SupabaseStore implements Store {
     const profile = await this.requireProfile(ownerId);
     const rows = await rest<Row[]>(
       "GET",
-      `/rest/v1/usage_monthly?owner_id=eq.${encodeURIComponent(ownerId)}&month=eq.${monthKey(now)}&select=edits,files,recalculations,proposals`
+      `/rest/v1/usage_monthly?owner_id=eq.${encodeURIComponent(ownerId)}&month=eq.${monthKey(now)}&select=edits,files,recalculations,proposals,reads`
     );
     return usageView(tierFor(profile), countsFrom(rows[0] ?? null), profile.retention_hours, now);
   }
@@ -397,7 +398,7 @@ export class SupabaseStore implements Store {
     const month = monthKey(now);
     const rows = await rest<Row[]>(
       "GET",
-      `/rest/v1/usage_monthly?owner_id=eq.${encodeURIComponent(ownerId)}&month=eq.${month}&select=edits,files,recalculations,proposals`
+      `/rest/v1/usage_monthly?owner_id=eq.${encodeURIComponent(ownerId)}&month=eq.${month}&select=edits,files,recalculations,proposals,reads`
     );
     const current = countsFrom(rows[0] ?? null);
     await rest("POST", "/rest/v1/usage_monthly", {
@@ -406,7 +407,8 @@ export class SupabaseStore implements Store {
       edits: counts.edits ?? current.edits,
       files: counts.files ?? current.files,
       recalculations: counts.recalculations ?? current.recalculations,
-      proposals: counts.proposals ?? current.proposals
+      proposals: counts.proposals ?? current.proposals,
+      reads: counts.reads ?? current.reads
     }, { Prefer: "resolution=merge-duplicates", on_conflict: "owner_id,month" });
   }
 
@@ -664,6 +666,28 @@ export class SupabaseStore implements Store {
     const units = usageUnits(sizeBytes);
     if (view.recalculations.used + units > view.recalculations.cap) {
       throw new QuotaError("recalculations", view.recalculations.used, view.recalculations.cap, tierFor(profile), now, units);
+    }
+  }
+
+  async recordRead(ownerId: string, now = new Date(), sizeBytes = 1) {
+    const profile = await this.requireEntitled(ownerId);
+    const tier = tierFor(profile);
+    const row = await rpc<Row>("stetwise_record_read", {
+      p_owner: ownerId,
+      p_month: monthKey(now),
+      p_cap: planCaps(tier).reads,
+      p_tier: tier,
+      p_units: usageUnits(sizeBytes)
+    });
+    return usageView(tier, countsFrom(row), profile.retention_hours, now);
+  }
+
+  async assertReadAllowed(ownerId: string, now = new Date(), sizeBytes = 1): Promise<void> {
+    const profile = await this.requireEntitled(ownerId);
+    const view = await this.usage(ownerId, now);
+    const units = usageUnits(sizeBytes);
+    if (view.reads.used + units > view.reads.cap) {
+      throw new QuotaError("reads", view.reads.used, view.reads.cap, tierFor(profile), now, units);
     }
   }
 

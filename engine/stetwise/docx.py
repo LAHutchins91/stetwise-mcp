@@ -473,10 +473,12 @@ def format_runs(
     italic: bool | None = None,
     underline: bool | None = None,
     occurrence: int | None = None,
+    font_size: float | None = None,
+    font_color: str | None = None,
 ) -> EditResult:
     from .docx_ops import format_runs as write_format
 
-    return write_format(package, find, bold, italic, underline, occurrence)
+    return write_format(package, find, bold, italic, underline, occurrence, font_size, font_color)
 
 
 def list_comments(package: Package) -> dict:

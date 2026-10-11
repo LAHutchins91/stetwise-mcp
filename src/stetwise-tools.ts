@@ -63,6 +63,7 @@ const operation = z
     column_width: z.number().positive().max(255).optional(),
     font_size: z.number().positive().max(409).optional(),
     font_color: z.string().regex(/^[0-9A-Fa-f]{6}$/).optional(),
+    font_colour: z.string().regex(/^[0-9A-Fa-f]{6}$/).optional(),
     border: z.literal(true).optional(),
     style: z.string().max(80).optional()
   })
@@ -113,6 +114,14 @@ export function createStetwiseServer(ownerId: string) {
   );
   const store = getStore();
 
+  async function countedRead<T>(size: number, run: () => Promise<T>): Promise<T> {
+    const now = new Date();
+    await store.assertReadAllowed(ownerId, now, size);
+    const value = await run();
+    await store.recordRead(ownerId, now, size);
+    return value;
+  }
+
   function tool(
     name: string,
     description: string,
@@ -150,7 +159,7 @@ export function createStetwiseServer(ownerId: string) {
 
   tool(
     "get_usage",
-    "Monthly applied-edit, file, recalculation, and proposal usage for this account. Each started 5 MB of a file counts as one unit. There is no overage charge.",
+    "Monthly applied-edit, file, recalculation, proposal, and read usage for this account. Each started 5 MB of a file counts as one unit. There is no overage charge.",
     {},
     read,
     async () => store.usage(ownerId)
@@ -317,21 +326,23 @@ export function createStetwiseServer(ownerId: string) {
     return { deleted: true, file_id };
   });
 
-  tool("inspect", "Map sheets, formulas, pivots, charts, comments, and tracked changes without changing the file.", { file_id: fileId }, read, async ({ file_id }) => {
+  tool("inspect", "Map sheets, formulas, pivots, charts, comments, and tracked changes without changing the file. Counts toward the monthly read cap.", { file_id: fileId }, read, async ({ file_id }) => {
     const loaded = await loadHead(store, ownerId, String(file_id));
-    const body = await callFileEngine<Record<string, unknown>>({
-      ownerId,
-      filename: loaded.file.filename,
-      action: "inspect",
-      sha: loaded.file.headSha,
-      bytes: loaded.bytes
+    return countedRead(loaded.file.size, async () => {
+      const body = await callFileEngine<Record<string, unknown>>({
+        ownerId,
+        filename: loaded.file.filename,
+        action: "inspect",
+        sha: loaded.file.headSha,
+        bytes: loaded.bytes
+      });
+      return { file_id, filename: loaded.file.filename, ...body };
     });
-    return { file_id, filename: loaded.file.filename, ...body };
   });
 
   tool(
     "read",
-    "Read an Excel range or a Word section. Formulas and cached values are both returned. Cached values are not recalculated.",
+    "Read an Excel range or a Word section. Formulas and cached values are both returned. Cached values are not recalculated. Counts toward the monthly read cap.",
     {
       file_id: fileId,
       sheet: z.string().max(200).optional(),
@@ -342,34 +353,38 @@ export function createStetwiseServer(ownerId: string) {
     read,
     async (args) => {
       const loaded = await loadHead(store, ownerId, String(args.file_id));
-      const body = await callFileEngine<Record<string, unknown>>({
-        ownerId,
-        filename: loaded.file.filename,
-        action: "read",
-        sha: loaded.file.headSha,
-        bytes: loaded.bytes,
-        extra: { sheet: args.sheet, range: args.range, anchor: args.anchor, limit: args.limit }
+      return countedRead(loaded.file.size, async () => {
+        const body = await callFileEngine<Record<string, unknown>>({
+          ownerId,
+          filename: loaded.file.filename,
+          action: "read",
+          sha: loaded.file.headSha,
+          bytes: loaded.bytes,
+          extra: { sheet: args.sheet, range: args.range, anchor: args.anchor, limit: args.limit }
+        });
+        return { file_id: args.file_id, ...body };
       });
-      return { file_id: args.file_id, ...body };
     }
   );
 
   tool(
     "search",
-    "Find text in a workbook or document, including Word text split across runs. Comment and header matches are reported and are not editable in v1.",
+    "Find text in a workbook or document, including Word text split across runs. Comment and header matches are reported and are not editable in v1. Counts toward the monthly read cap.",
     { file_id: fileId, query: z.string().min(1).max(500), limit: z.number().int().min(1).max(50).optional() },
     read,
     async ({ file_id: id, query, limit }) => {
       const loaded = await loadHead(store, ownerId, String(id));
-      const body = await callFileEngine<Record<string, unknown>>({
-        ownerId,
-        filename: loaded.file.filename,
-        action: "search",
-        sha: loaded.file.headSha,
-        bytes: loaded.bytes,
-        extra: { query, limit: limit ?? 50 }
+      return countedRead(loaded.file.size, async () => {
+        const body = await callFileEngine<Record<string, unknown>>({
+          ownerId,
+          filename: loaded.file.filename,
+          action: "search",
+          sha: loaded.file.headSha,
+          bytes: loaded.bytes,
+          extra: { query, limit: limit ?? 50 }
+        });
+        return { file_id: id, ...body };
       });
-      return { file_id: id, ...body };
     }
   );
 
@@ -430,37 +445,42 @@ export function createStetwiseServer(ownerId: string) {
     }
   );
 
-  tool("list_versions", "List immutable versions of one file, oldest first.", { file_id: fileId }, read, async ({ file_id: id }) => ({
-    file_id: id,
-    versions: await store.listVersions(ownerId, String(id))
-  }));
+  tool("list_versions", "List immutable versions of one file, oldest first. Counts toward the monthly read cap.", { file_id: fileId }, read, async ({ file_id: id }) => {
+    const file = await store.getFile(ownerId, String(id));
+    return countedRead(file.size, async () => ({
+      file_id: id,
+      versions: await store.listVersions(ownerId, String(id))
+    }));
+  });
 
   tool(
     "diff_versions",
-    "Compare two saved versions and report which package parts differ. Does not change the file.",
+    "Compare two saved versions and report which package parts differ. Does not change the file. Counts toward the monthly read cap.",
     { file_id: fileId, from_version: z.number().int().positive(), to_version: z.number().int().positive() },
     read,
     async ({ file_id: id, from_version, to_version }) => {
-      const versions = await store.listVersions(ownerId, String(id));
-      const from = versions.find((item) => item.version === from_version);
-      const to = versions.find((item) => item.version === to_version);
-      if (!from || !to) throw new ToolError("That version does not exist.", "not_found");
       const loaded = await loadHead(store, ownerId, String(id));
-      let beforeBytes: Buffer | undefined;
-      let afterBytes: Buffer | undefined;
-      if (!hostedEngine()) {
-        beforeBytes = (await store.readOwnedBlob(ownerId, String(id), from.sha256)).bytes;
-        afterBytes = (await store.readOwnedBlob(ownerId, String(id), to.sha256)).bytes;
-      }
-      const report = await verifyStoredPair({
-        ownerId,
-        filename: loaded.file.filename,
-        beforeSha: from.sha256,
-        afterSha: to.sha256,
-        before: beforeBytes,
-        after: afterBytes
+      return countedRead(loaded.file.size, async () => {
+        const versions = await store.listVersions(ownerId, String(id));
+        const from = versions.find((item) => item.version === from_version);
+        const to = versions.find((item) => item.version === to_version);
+        if (!from || !to) throw new ToolError("That version does not exist.", "not_found");
+        let beforeBytes: Buffer | undefined;
+        let afterBytes: Buffer | undefined;
+        if (!hostedEngine()) {
+          beforeBytes = (await store.readOwnedBlob(ownerId, String(id), from.sha256)).bytes;
+          afterBytes = (await store.readOwnedBlob(ownerId, String(id), to.sha256)).bytes;
+        }
+        const report = await verifyStoredPair({
+          ownerId,
+          filename: loaded.file.filename,
+          beforeSha: from.sha256,
+          afterSha: to.sha256,
+          before: beforeBytes,
+          after: afterBytes
+        });
+        return { file_id: id, from_version, to_version, ...report };
       });
-      return { file_id: id, from_version, to_version, ...report };
     }
   );
 

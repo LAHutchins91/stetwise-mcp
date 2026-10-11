@@ -14,6 +14,8 @@ describe("monthly caps", () => {
     delete process.env.STETWISE_CAP_PRO_EDITS;
     delete process.env.STETWISE_CAP_PRO_RECALCS;
     delete process.env.STETWISE_CAP_PRO_PROPOSALS;
+    delete process.env.STETWISE_CAP_PRO_READS;
+    delete process.env.STETWISE_CAP_TRIAL_READS;
     await getStore().ensureDevProfile();
   });
 
@@ -21,8 +23,9 @@ describe("monthly caps", () => {
     expect(planCaps("pro")).toMatchObject({
       edits: 1000,
       files: 250,
-      recalculations: 100,
+      recalculations: 200,
       proposals: 2000,
+      reads: 1000,
       maxFileBytes: 25 * 1024 * 1024
     });
     expect(planCaps("trial")).toMatchObject({
@@ -30,6 +33,7 @@ describe("monthly caps", () => {
       files: 25,
       recalculations: 20,
       proposals: 200,
+      reads: 200,
       maxFileBytes: 25 * 1024 * 1024
     });
     expect(usageUnits(USAGE_UNIT_BYTES)).toBe(1);
@@ -79,8 +83,9 @@ describe("monthly caps", () => {
     expect(view.tier).toBe("pro");
     expect(view.edits.cap).toBe(1000);
     expect(view.files.cap).toBe(250);
-    expect(view.recalculations.cap).toBe(100);
+    expect(view.recalculations.cap).toBe(200);
     expect(view.proposals.cap).toBe(2000);
+    expect(view.reads.cap).toBe(1000);
     expect(view.max_file_bytes).toBe(25 * 1024 * 1024);
   });
 
@@ -96,6 +101,18 @@ describe("monthly caps", () => {
       store.commitNewFile({ ownerId: DEV_USER_ID, filename: "wide.xlsx", kind: "xlsx", bytes: big })
     ).rejects.toBeInstanceOf(QuotaError);
     expect((await store.usage(DEV_USER_ID)).files.used).toBe(24);
+  });
+
+  it("counts reads in 5 MB units and blocks the call that would pass the cap", async () => {
+    const store = getStore();
+    process.env.STETWISE_CAP_TRIAL_READS = "2";
+    await store.recordRead(DEV_USER_ID, new Date(), USAGE_UNIT_BYTES);
+    expect((await store.usage(DEV_USER_ID)).reads.used).toBe(1);
+    await expect(store.recordRead(DEV_USER_ID, new Date(), 25 * 1024 * 1024)).rejects.toBeInstanceOf(QuotaError);
+    expect((await store.usage(DEV_USER_ID)).reads.used).toBe(1);
+    await store.assertReadAllowed(DEV_USER_ID, new Date(), USAGE_UNIT_BYTES);
+    await expect(store.assertReadAllowed(DEV_USER_ID, new Date(), 25 * 1024 * 1024)).rejects.toBeInstanceOf(QuotaError);
+    delete process.env.STETWISE_CAP_TRIAL_READS;
   });
 
   it("counts a saved proposal and blocks the next one at the cap", async () => {

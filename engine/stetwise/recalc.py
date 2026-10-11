@@ -22,6 +22,7 @@ from .xmlutil import parse_xml, xml_escape
 from .zippack import Package
 
 _F_TAG = None
+_EXCEL_ERRORS = {"#DIV/0!", "#N/A", "#NAME?", "#NULL!", "#NUM!", "#REF!", "#VALUE!"}
 
 
 def _uno_python() -> str:
@@ -105,6 +106,25 @@ def _patch_many(xml: bytes, updates: dict[str, tuple[str, str]]) -> bytes:
     return b"".join(pieces)
 
 
+def _remove_profile(path: str) -> None:
+    """Delete one LibreOffice profile directory. A timeout SIGKILLs the worker before its own cleanup."""
+    if not path:
+        return
+    folder = Path(path)
+    name = folder.name
+    if not name.startswith("stetwise-lo-") or name in {".", ".."} or "/" in name:
+        return
+    root = Path(os.environ.get("TMPDIR") or "/tmp")
+    try:
+        resolved = folder.resolve()
+        allowed = root.resolve()
+    except OSError:
+        return
+    if resolved.parent != allowed or not resolved.is_dir():
+        return
+    shutil.rmtree(resolved, ignore_errors=True)
+
+
 def _reap(pid_path: Path) -> None:
     """Stop the soffice process group. The worker is SIGKILLed on timeout, so its finally does not run."""
     if not pid_path.exists():
@@ -129,6 +149,7 @@ def _reap(pid_path: Path) -> None:
                 break
     if token:
         _kill_cmdline(token)
+    _remove_profile(token)
 
 
 def _kill_cmdline(token: str) -> None:
@@ -149,6 +170,20 @@ def _kill_cmdline(token: str) -> None:
             os.kill(int(entry.name), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+
+
+def _unmapped_errors(calculated: dict) -> list[tuple[str, str, str]]:
+    found: list[tuple[str, str, str]] = []
+    for sheet, cells in calculated.items():
+        if not isinstance(cells, dict):
+            continue
+        for ref, item in cells.items():
+            if not isinstance(item, dict):
+                continue
+            raw = str(item.get("raw") or "")
+            if item.get("unmapped") or (item.get("kind") == "e" and raw not in _EXCEL_ERRORS):
+                found.append((str(sheet), str(ref), raw or "Err"))
+    return found
 
 
 def _drop_value(inner: bytes) -> bytes:
@@ -208,6 +243,16 @@ def recalculate(blob: bytes, filename: str, package: Package) -> dict:
             )
         report = json.loads(report_path.read_text(encoding="utf-8"))
     calculated = report.get("sheets") or {}
+    blocked = _unmapped_errors(calculated)
+    if blocked:
+        sheet, ref, raw = blocked[0]
+        extra = f" {len(blocked)} formula cells had a LibreOffice error that is not an Excel error." if len(blocked) > 1 else ""
+        raise StetwiseRefusal(
+            f"LibreOffice returned {raw} for {sheet}!{ref}. That is not an Excel error value "
+            f"(#DIV/0!, #N/A, #NAME?, #NULL!, #NUM!, #REF!, or #VALUE!).{extra} No cached values were written.",
+            "recalc_failed",
+            started=True,
+        )
     original_names = {sheet.name for sheet in xlsx.sheet_map(package)}
     if not original_names.issubset(set(calculated)):
         missing = sorted(original_names - set(calculated))
@@ -232,6 +277,12 @@ def recalculate(blob: bytes, filename: str, package: Package) -> dict:
                 continue
             kind = found["kind"]
             raw = found["raw"]
+            if kind == "e" and raw not in _EXCEL_ERRORS:
+                raise StetwiseRefusal(
+                    f"LibreOffice returned {raw} for {sheet.name}!{cell['ref']}. That is not an Excel error value. No cached values were written.",
+                    "recalc_failed",
+                    started=True,
+                )
             old_type = "e" if cell.get("type") == "e" else ("str" if cell.get("type") in {"str", "inlineStr", "s"} else "n")
             if cell.get("type") == "b":
                 old_type = "b"
@@ -267,7 +318,7 @@ def recalculate(blob: bytes, filename: str, package: Package) -> dict:
         set(),
         [{"op": "recalculate", "source": "LibreOffice", "changes": changes}],
         [
-            "Cached values were calculated by LibreOffice on a copy. The original package was not replaced. Excel may recalculate again on open."
+            "Cached values were calculated by LibreOffice's engine on a copy. Results may differ from Excel on edge cases. The original package was not replaced. Excel may recalculate again on open."
         ],
     )
     preview["changed"] = True

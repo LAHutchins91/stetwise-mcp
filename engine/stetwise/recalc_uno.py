@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -33,12 +34,47 @@ def _port() -> int:
     return port
 
 
+# LibreOffice FormulaError values that are the Excel error of the same meaning.
+# getError() is stable across locales. Err:502, Err:504, and the other Err: codes
+# are LibreOffice-only and are not written into an xlsx.
+_EXACT_ERROR = {
+    503: "#NUM!",
+    519: "#VALUE!",
+    521: "#NULL!",
+    524: "#REF!",
+    525: "#NAME?",
+    532: "#DIV/0!",
+    32767: "#N/A",
+}
+_EXCEL_ERRORS = set(_EXACT_ERROR.values())
+
+
 def _num_text(value: float) -> str:
-    if value != value or value in (float("inf"), float("-inf")):
+    """Shortest round-trip spelling of the IEEE double, up to 17 significant digits."""
+    if value != value or value in (float("inf"), float("-inf")) or value == 0.0:
         return "0"
-    if abs(value) < 1e15 and float(value).is_integer():
+    if abs(value) < 1e15 and value.is_integer():
         return str(int(value))
-    return format(value, ".15g")
+    return repr(value)
+
+
+def _excel_error(code: int, shown: str) -> tuple[str, bool]:
+    mapped = _EXACT_ERROR.get(code)
+    if mapped:
+        return mapped, False
+    text = (shown or "").strip()
+    if text in _EXCEL_ERRORS:
+        return text, False
+    if text.startswith("Err:"):
+        try:
+            mapped = _EXACT_ERROR.get(int(text[4:]))
+        except ValueError:
+            mapped = None
+        if mapped:
+            return mapped, False
+        return text, True
+    label = text or f"Err:{code}"
+    return label, True
 
 
 def _colname(index: int) -> str:
@@ -133,8 +169,14 @@ def _sheet_cells(doc, sheet) -> dict[str, dict[str, str]]:
                 continue
             ref = f"{_colname(col)}{row + 1}"
             if (row, col) in errors:
-                text = str(sheet.getCellByPosition(col, row).getString() or "")
-                cells[ref] = {"kind": "e", "raw": text or "#VALUE!"}
+                cell = sheet.getCellByPosition(col, row)
+                code = int(cell.getError())
+                shown = str(cell.getString() or "")
+                raw, unmapped = _excel_error(code, shown)
+                item = {"kind": "e", "raw": raw}
+                if unmapped:
+                    item["unmapped"] = True
+                cells[ref] = item
                 continue
             value = data_row[col]
             if isinstance(value, bool):
@@ -145,7 +187,14 @@ def _sheet_cells(doc, sheet) -> dict[str, dict[str, str]]:
                 else:
                     cells[ref] = {"kind": "n", "raw": _num_text(value)}
             elif isinstance(value, str):
-                cells[ref] = {"kind": "str", "raw": value}
+                if value.startswith("Err:"):
+                    raw, unmapped = _excel_error(0, value)
+                    item = {"kind": "e", "raw": raw}
+                    if unmapped:
+                        item["unmapped"] = True
+                    cells[ref] = item
+                else:
+                    cells[ref] = {"kind": "str", "raw": value}
             elif value is None:
                 cells[ref] = {"kind": "n", "raw": "0"}
             else:
@@ -226,6 +275,11 @@ def main() -> None:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        shutil.rmtree(profile, ignore_errors=True)
 
 
 if __name__ == "__main__":

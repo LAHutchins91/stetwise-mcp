@@ -12,7 +12,7 @@ export function installPublicPages(app: Express) {
       page(
         "Stetwise access",
         `<p>Editing tools are available during the 14-day trial and on Pro. This connection does not have that access. It cannot start a purchase or add an overage charge.</p>
-<p>Trial accounts can apply 100 edits, save 200 proposals, and run 20 recalculations per UTC month, and store 25 new files. Pro accounts can apply 1,000 edits, save 2,000 proposals, store 250 new files, and run 100 recalculations. Each started 5 MB of a file counts as one unit. Each file must be at most 25 MB (26,214,400 bytes). Past a cap, Stetwise blocks the call. Nothing extra is billed.</p>
+<p>Trial accounts can apply 100 edits, save 200 proposals, use 200 reads, and run 20 recalculations per UTC month, and store 25 new files. Pro accounts can apply 1,000 edits, save 2,000 proposals, use 1,000 reads, store 250 new files, and run 200 recalculations. Each started 5 MB of a file counts as one unit. Each file must be at most 25 MB (26,214,400 bytes). Past a cap, Stetwise blocks the call. Nothing extra is billed.</p>
 <p><a href="/connections">Manage the connection</a> or <a href="/support">contact support</a> if this looks wrong.</p>`
       )
     )
@@ -34,7 +34,7 @@ export function installPublicPages(app: Express) {
 <p>Supabase provides email sign-in and, when configured, the database and private file storage. Vercel may host the MCP and account pages. The engine runs as a container on Vercel (2 vCPU and 4 GB) or on Fly.io. Stripe processes payment. Sign-in is email, plus the OAuth consent an assistant opens. We do not offer Google sign-in. We do not store complete card numbers.</p>
 <p>The engine accepts HMAC-signed requests from the MCP server. Each request carries a timestamp and a nonce, and is rejected when it is older than 5 minutes or when that nonce was already used. The engine then fetches and writes the private Storage objects named in the request, and it can download an attachment URL the MCP server has already checked. File contents are not logged. Vercel and Fly.io cannot enforce a ban on outbound connections, so that is not a guarantee. Unsigned clients cannot call the engine.</p>
 <h2>Caps</h2>
-<p>Monthly caps limit applied edits, new files, proposals, and recalculations. Each started 5 MB counts as one unit. Stetwise does not bill overage. A refused call is the whole response.</p>`
+<p>Monthly caps limit applied edits, new files, proposals, reads, and recalculations. Each started 5 MB counts as one unit. Stetwise does not bill overage. A refused call is the whole response.</p>`
       )
     )
   );
@@ -48,7 +48,7 @@ export function installPublicPages(app: Express) {
 <h2>Paid access</h2>
 <p>Tools require a trial or Pro. The 14-day trial and the billing interval are shown by Stripe before you pay. This service does not add usage charges when you pass a monthly cap; the call is blocked. Cancel in the billing portal. Cancellation does not by itself delete files. Deletion is separate, on <a href="/data">Your data</a>.</p>
 <h2>Limits</h2>
-<p>The assistant decides when to call a tool. Stetwise does not promise Excel-identical recalculation in v1, and it does not run macros. Review the diff before you apply. Keep your own copy of anything you cannot lose.</p>`
+<p>The assistant decides when to call a tool. Recalculation uses LibreOffice's engine, and results may differ from Excel on edge cases. Stetwise does not run macros. Review the diff before you apply. Keep your own copy of anything you cannot lose.</p>`
       )
     )
   );

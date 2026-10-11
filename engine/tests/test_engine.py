@@ -1,5 +1,7 @@
 import hashlib
 import io
+import os
+import re
 import time
 import zipfile
 from pathlib import Path
@@ -7,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from stetwise.engine import dispatch, propose, search, inspect
+from stetwise.recalc_uno import _excel_error, _num_text
 from stetwise.errors import StetwiseRefusal
 from stetwise.refs import Shift, shift_formula
 from stetwise.zippack import read_package, write_package
@@ -38,6 +41,11 @@ def _part(blob: bytes, name: str) -> bytes:
 
 def _compressed(blob: bytes, name: str) -> bytes:
     return read_package(blob).by_name()[name].compressed
+
+
+def _lo_profiles() -> set[Path]:
+    root = Path(os.environ.get("TMPDIR") or "/tmp")
+    return {path for path in root.glob("stetwise-lo-*") if path.is_dir()}
 
 
 def _soffice_orphans() -> list[str]:
@@ -550,6 +558,7 @@ def test_recalculate_keeps_date_serials_and_typed_caches():
 
 
 def test_recalculate_timeout_leaves_no_soffice(monkeypatch):
+    before_profiles = _lo_profiles()
     monkeypatch.setenv("STETWISE_RECALC_TIMEOUT", "1")
     monkeypatch.setenv("STETWISE_RECALC_HOLD", "15")
     response = dispatch({"action": "recalculate", "filename": "stale.xlsx", "data_b64": _b64(stale_xlsx())})
@@ -559,6 +568,132 @@ def test_recalculate_timeout_leaves_no_soffice(monkeypatch):
     deadline = time.time() + 5
     while time.time() < deadline and _soffice_orphans():
         time.sleep(0.1)
+    assert _soffice_orphans() == []
+    assert _lo_profiles() <= before_profiles
+
+
+_NS_CT = "http://schemas.openxmlformats.org/package/2006/content-types"
+_NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+_NS_OFF = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_NS_X = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+
+
+def _formula_book(formulas: list[str]) -> bytes:
+    rows = []
+    for index, formula in enumerate(formulas, start=1):
+        text = formula.replace("&", "&amp;").replace("<", "&lt;")
+        rows.append(f'<row r="{index}"><c r="A{index}"><f>{text}</f><v>0</v></c></row>')
+    parts = {
+        "[Content_Types].xml": f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="{_NS_CT}"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>''',
+        "_rels/.rels": f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="{_NS_REL}"><Relationship Id="rId1" Type="{_NS_OFF}/officeDocument" Target="xl/workbook.xml"/></Relationships>''',
+        "xl/_rels/workbook.xml.rels": f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="{_NS_REL}"><Relationship Id="rId1" Type="{_NS_OFF}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{_NS_OFF}/styles" Target="styles.xml"/></Relationships>''',
+        "xl/workbook.xml": f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="{_NS_X}" xmlns:r="{_NS_OFF}"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>''',
+        "xl/styles.xml": f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="{_NS_X}"><fonts count="1"><font/></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs></styleSheet>''',
+        "xl/worksheets/sheet1.xml": f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="{_NS_X}"><sheetData>{"".join(rows)}</sheetData></worksheet>''',
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, text in parts.items():
+            archive.writestr(name, text)
+    return buffer.getvalue()
+
+
+def _excel_numeric_caches() -> list[str]:
+    path = POI / "FormulaEvalTestData_Copy.xlsx"
+    archive = zipfile.ZipFile(path)
+    cell = re.compile(br"<c\b([^>]*)>(.*?)</c>", re.DOTALL)
+    value = re.compile(br"<v>([^<]*)</v>")
+    found = []
+    for name in archive.namelist():
+        if not name.startswith("xl/worksheets/"):
+            continue
+        xml = archive.read(name)
+        for match in cell.finditer(xml):
+            attrs, inner = match.group(1), match.group(2)
+            if b"<f" not in inner:
+                continue
+            kind = re.search(br'\bt="([^"]+)"', attrs)
+            if kind and kind.group(1) != b"n":
+                continue
+            cached = value.search(inner)
+            if not cached:
+                continue
+            raw = cached.group(1).decode()
+            try:
+                float(raw)
+            except ValueError:
+                continue
+            found.append(raw)
+    return found
+
+
+def test_num_text_preserves_excel_saved_doubles():
+    caches = _excel_numeric_caches()
+    assert len(caches) > 700
+    lost_at_15 = 0
+    for raw in caches:
+        value = float(raw)
+        text = _num_text(value)
+        assert float(text) == value
+        assert text == ("0" if value == 0.0 else (str(int(value)) if abs(value) < 1e15 and value.is_integer() else repr(value)))
+        truncated = str(int(value)) if abs(value) < 1e15 and value.is_integer() else format(value, ".15g")
+        if float(truncated) != value:
+            lost_at_15 += 1
+    assert lost_at_15 > 100
+    excel = "0.66666666666666663"
+    assert float(_num_text(float(excel))) == float(excel)
+    assert _num_text(float(excel)) == "0.6666666666666666"
+    assert float(format(float(excel), ".15g")) != float(excel)
+    assert _excel_error(532, "#DIV/0!") == ("#DIV/0!", False)
+    assert _excel_error(503, "#NUM!") == ("#NUM!", False)
+    assert _excel_error(519, "#VALUE!") == ("#VALUE!", False)
+    assert _excel_error(521, "#NULL!") == ("#NULL!", False)
+    assert _excel_error(524, "#REF!") == ("#REF!", False)
+    assert _excel_error(525, "#NAME?") == ("#NAME?", False)
+    assert _excel_error(32767, "#N/A") == ("#N/A", False)
+    assert _excel_error(502, "Err:502") == ("Err:502", True)
+    assert _excel_error(504, "Err:504") == ("Err:504", True)
+
+
+def test_recalculate_writes_round_trip_numbers_and_exact_errors():
+    before = _lo_profiles()
+    third = dispatch({"action": "recalculate", "filename": "third.xlsx", "data_b64": _b64(_formula_book(["2/3"]))})
+    assert third["ok"] is True, third
+    sheet = _part(_bytes(third["result"]), "xl/worksheets/sheet1.xml")
+    cached = re.search(br"<v>([^<]*)</v>", sheet).group(1).decode()
+    assert cached == _num_text(float(cached))
+    assert float(cached) == float("0.66666666666666663")
+    assert cached != "0.666666666666667"
+    exact = dispatch({"action": "recalculate", "filename": "errors.xlsx", "data_b64": _b64(_formula_book(["1/0", "NA()", "ASIN(2)", '1+"a"', "NOSUCH()"]))})
+    assert exact["ok"] is True, exact
+    errors = _part(_bytes(exact["result"]), "xl/worksheets/sheet1.xml")
+    assert b"Err:" not in errors
+    for token in (b"#DIV/0!", b"#N/A", b"#NUM!", b"#VALUE!", b"#NAME?"):
+        assert token in errors
+    assert _lo_profiles() <= before
+    assert _soffice_orphans() == []
+
+
+def test_recalculate_refuses_unmapped_libreoffice_errors():
+    before = _lo_profiles()
+    response = dispatch({"action": "recalculate", "filename": "sqrt.xlsx", "data_b64": _b64(_formula_book(["SQRT(-1)", "MATCH(1,1,1)"]))})
+    assert response["ok"] is False
+    assert response["error"]["code"] == "recalc_failed"
+    assert response["error"]["started"] is True
+    reason = response["error"]["reason"]
+    assert "Err:502" in reason or "Err:504" in reason
+    assert "No cached values were written" in reason
+    assert "data_b64" not in response.get("result", {})
+    assert _lo_profiles() <= before
     assert _soffice_orphans() == []
 
 
@@ -573,6 +708,19 @@ def test_create_blank_then_edit_and_list_comments():
     assert document["ok"] is True
     filled = _propose(_bytes(document["result"]), "blank.docx", [{"op": "replace_paragraph", "anchor": "p-0", "text": "Hello"}])
     assert b"Hello" in _part(_bytes(filled), "word/document.xml")
+    styles = _part(_bytes(document["result"]), "word/styles.xml")
+    for style_id in (b"Heading1", b"Heading2", b"Heading3", b"ListBullet", b"ListNumber"):
+        assert style_id in styles
+    for style_id, label in (("Heading1", "Title"), ("Heading2", "Section"), ("Heading3", "Detail"), ("ListBullet", "Bullet"), ("ListNumber", "Numbered")):
+        inserted = _propose(
+            _bytes(document["result"]),
+            "blank.docx",
+            [{"op": "insert_paragraph", "anchor": "p-0", "text": label, "style": style_id}],
+        )
+        body = _part(_bytes(inserted), "word/document.xml")
+        assert label.encode() in body
+        assert f'w:val="{style_id}"'.encode() in body
+        assert _compressed(_bytes(inserted), "word/styles.xml") == _compressed(_bytes(document["result"]), "word/styles.xml")
     comments = dispatch({"action": "list_comments", "filename": "comment.docx", "data_b64": _b64(POI.joinpath("comment.docx").read_bytes())})
     assert comments["ok"] is True
     first = comments["result"]["comments"][0]
@@ -608,6 +756,19 @@ def test_word_paragraphs_tracking_and_run_format():
     runs = _part(_bytes(formatted), "word/document.xml")
     assert b"<w:u " in runs or b"<w:u/>" in runs
     assert _compressed(_bytes(formatted), "word/styles.xml") == _compressed(original, "word/styles.xml")
+    coloured = _propose(
+        original,
+        "contract.docx",
+        [{"op": "format_runs", "find": "Acme", "font_size": 14, "font_colour": "ff0000"}],
+    )
+    coloured_doc = _part(_bytes(coloured), "word/document.xml")
+    assert b'<w:sz w:val="28"/>' in coloured_doc
+    assert b'<w:szCs w:val="28"/>' in coloured_doc
+    assert b'<w:color w:val="FF0000"/>' in coloured_doc
+    assert _compressed(_bytes(coloured), "word/styles.xml") == _compressed(original, "word/styles.xml")
+    with pytest.raises(StetwiseRefusal) as bad_colour:
+        propose(original, "contract.docx", [{"op": "format_runs", "find": "Acme", "font_color": "red"}])
+    assert bad_colour.value.code == "bad_format"
     assert _compressed(_bytes(formatted), "word/comments.xml") == _compressed(original, "word/comments.xml")
     settings = settings_docx()
     marked = _propose(settings, "settings.docx", [{"op": "replace_text", "find": "Beta", "replace": "Gamma", "track_changes": True}])
