@@ -77,20 +77,34 @@ describe("OAuth resource audience", () => {
     await db.close();
   });
 
+  async function callHook(event: ReturnType<typeof oauthEvent>): Promise<HookEvent | undefined> {
+    await db.exec("set role supabase_auth_admin");
+    try {
+      const result = await db.query<HookRow>(`select public.stetwise_access_token_hook(${slot(1)}::jsonb) as event`, [
+        JSON.stringify(event)
+      ]);
+      return result.rows[0]?.event;
+    } finally {
+      await db.exec("reset role");
+    }
+  }
+
   async function audience(sessionId: string, clientId: string | null, method = "oauth"): Promise<unknown> {
     await db.query(`insert into auth.sessions (id, user_id) values (${slot(1)}, ${slot(2)}) on conflict do nothing`, [sessionId, user]);
-    const result = await db.query<HookRow>(`select public.stetwise_access_token_hook(${slot(1)}::jsonb) as event`, [
-      JSON.stringify(oauthEvent(sessionId, clientId, method))
-    ]);
-    return result.rows[0]?.event?.claims?.aud;
+    const event = await callHook(oauthEvent(sessionId, clientId, method));
+    return event?.claims?.aud;
   }
 
   async function setLatest(clientId: string, id: string, resource: string | null) {
     await db.query(`delete from auth.oauth_authorizations where client_id = ${slot(1)}`, [clientId]);
+    await approve(clientId, id, resource, "0 minutes");
+  }
+
+  async function approve(clientId: string, id: string, resource: string | null, age: string) {
     await db.query(
       `insert into auth.oauth_authorizations (id, client_id, user_id, status, expires_at, resource, created_at)
-       values (${slot(1)}, ${slot(2)}, ${slot(3)}, 'approved', now() + interval '1 hour', ${slot(4)}, now())`,
-      [id, clientId, user, resource]
+       values (${slot(1)}, ${slot(2)}, ${slot(3)}, 'approved', now() + interval '10 minutes', ${slot(4)}, now() - ${slot(5)}::interval)`,
+      [id, clientId, user, resource, age]
     );
   }
 
@@ -142,10 +156,7 @@ describe("OAuth resource audience", () => {
     await setLatest(clientA, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac", expected);
     await db.query(`insert into auth.sessions (id, user_id) values (${slot(1)}, ${slot(2)}) on conflict do nothing`, [sessionId, user]);
     const input = oauthEvent(sessionId, null, "password");
-    const result = await db.query<HookRow>(`select public.stetwise_access_token_hook(${slot(1)}::jsonb) as event`, [
-      JSON.stringify(input)
-    ]);
-    expect(result.rows[0]?.event).toEqual(input);
+    expect(await callHook(input)).toEqual(input);
   });
 
   it("does not let another client's grant or a stored evil resource bind this server", async () => {
@@ -166,10 +177,71 @@ describe("OAuth resource audience", () => {
 
     await db.query(`insert into auth.sessions (id, user_id) values (${slot(1)}, ${slot(2)}) on conflict do nothing`, [refresh, user]);
     await db.query(
-      `insert into stetwise_private.oauth_resources (session_id, resource) values (${slot(1)}, ${slot(2)}) on conflict (session_id) do update set resource = excluded.resource`,
+      `insert into stetwise_private.oauth_resources (session_id, resource, strict_match) values (${slot(1)}, ${slot(2)}, false) on conflict (session_id) do update set resource = excluded.resource, strict_match = false`,
       [refresh, expected]
     );
-    expect(await audience(refresh, clientA)).toEqual(["authenticated", expected]);
+    expect(await audience(refresh, clientA)).toBe("authenticated");
+    const kept = await db.query<{ strict_match: boolean }>(
+      `select strict_match from stetwise_private.oauth_resources where session_id = ${slot(1)}`,
+      [refresh]
+    );
+    expect(kept.rows[0]?.strict_match).toBe(false);
+  });
+
+  it("binds only when every open authorization is the configured URL", async () => {
+    const evilFirst = "55555555-5555-4555-8555-555555555571";
+    const realFirst = "55555555-5555-4555-8555-555555555572";
+    const alone = "55555555-5555-4555-8555-555555555573";
+    const withNull = "55555555-5555-4555-8555-555555555574";
+
+    await db.query(`delete from auth.oauth_authorizations where client_id = ${slot(1)}`, [clientA]);
+    await approve(clientA, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "https://evil.example/mcp", "2 minutes");
+    await approve(clientA, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2", expected, "1 minute");
+    expect(await audience(evilFirst, clientA)).toBe("authenticated");
+    const raced = await db.query<{ n: number }>(
+      `select count(*)::int as n from stetwise_private.oauth_resources where session_id = ${slot(1)} and strict_match`,
+      [evilFirst]
+    );
+    expect(raced.rows[0]?.n).toBe(0);
+
+    await db.query(`delete from auth.oauth_authorizations where client_id = ${slot(1)}`, [clientA]);
+    await approve(clientA, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb3", expected, "2 minutes");
+    await approve(clientA, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb4", "https://evil.example/mcp", "1 minute");
+    expect(await audience(realFirst, clientA)).toBe("authenticated");
+
+    await db.query(`delete from auth.oauth_authorizations where client_id = ${slot(1)}`, [clientA]);
+    await approve(clientA, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb5", expected, "0 minutes");
+    expect(await audience(alone, clientA)).toEqual(["authenticated", expected]);
+    const seeded = await db.query<{ strict_match: boolean; resource: string }>(
+      `select strict_match, resource from stetwise_private.oauth_resources where session_id = ${slot(1)}`,
+      [alone]
+    );
+    expect(seeded.rows[0]).toEqual({ strict_match: true, resource: expected });
+    await db.query(`delete from auth.oauth_authorizations where client_id = ${slot(1)}`, [clientA]);
+    expect(await audience(alone, clientA)).toEqual(["authenticated", expected]);
+
+    await db.query(`delete from auth.oauth_authorizations where client_id = ${slot(1)}`, [clientA]);
+    await approve(clientA, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb6", expected, "1 minute");
+    await approve(clientA, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb7", null, "0 minutes");
+    expect(await audience(withNull, clientA)).toBe("authenticated");
+  });
+
+  it("documents the residual: a no-resource code binds once a matching approval is the only open one", async () => {
+    // Supabase does not attach the exchanged code to an authorization row. While a
+    // no-resource approval is still open, every-row matching refuses the bind. After
+    // that row leaves the window, a matching approval for the same client and user
+    // (about 10 minutes) is the only open row, and this session binds. Low risk: that
+    // user already approved this client for this exact server.
+    const sessionId = "55555555-5555-4555-8555-555555555575";
+    const nullId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb8";
+    await db.query(`delete from auth.oauth_authorizations where client_id = ${slot(1)}`, [clientA]);
+    await approve(clientA, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb9", expected, "1 minute");
+    await approve(clientA, nullId, null, "0 minutes");
+    expect(await audience(sessionId, clientA)).toBe("authenticated");
+
+    await db.query(`update auth.oauth_authorizations set expires_at = now() - interval '1 minute' where id = ${slot(1)}`, [nullId]);
+    const later = "55555555-5555-4555-8555-555555555576";
+    expect(await audience(later, clientA)).toEqual(["authenticated", expected]);
   });
 
   it("keeps execute limited to supabase_auth_admin and an empty search_path", async () => {
@@ -178,12 +250,14 @@ describe("OAuth resource audience", () => {
       auth_exec: boolean;
       public_exec: boolean;
       admin_exec: boolean;
+      admin_select: boolean;
       config: string[] | null;
     }>(`
       select has_function_privilege('anon', 'public.stetwise_access_token_hook(jsonb)', 'execute') as anon_exec,
              has_function_privilege('authenticated', 'public.stetwise_access_token_hook(jsonb)', 'execute') as auth_exec,
              has_function_privilege('public', 'public.stetwise_access_token_hook(jsonb)', 'execute') as public_exec,
              has_function_privilege('supabase_auth_admin', 'public.stetwise_access_token_hook(jsonb)', 'execute') as admin_exec,
+             has_table_privilege('supabase_auth_admin', 'auth.oauth_authorizations', 'select') as admin_select,
              p.proconfig as config
         from pg_proc p
         join pg_namespace n on n.oid = p.pronamespace
@@ -194,6 +268,7 @@ describe("OAuth resource audience", () => {
     expect(row?.auth_exec).toBe(false);
     expect(row?.public_exec).toBe(false);
     expect(row?.admin_exec).toBe(true);
+    expect(row?.admin_select).toBe(true);
     expect(row?.config?.some((item) => item.startsWith("search_path="))).toBe(true);
     expect(row?.config?.join(" ")).not.toContain("public");
     const setting = await db.query<{ value: string }>("select value from stetwise_private.settings where key = 'mcp_resource'");

@@ -5,6 +5,13 @@
 --   update stetwise_private.settings set value = 'https://YOUR_HOST/mcp' where key = 'mcp_resource';
 --   Dashboard: Authentication → Hooks → Custom Access Token → public.stetwise_access_token_hook
 -- Re-applying is safe. The setting is not overwritten.
+--
+-- Supabase does not attach a session to the authorization it came from. Bind only when
+-- at least one approved, unexpired authorization for this client_id and user exists and
+-- every one of those rows normalizes to the configured URL. Another resource, or a null
+-- resource, leaves aud as "authenticated". There is no newest-row shortcut.
+-- A session row is trusted on refresh only when this rule wrote it (strict_match).
+-- Rows written by the previous newest-authorization hook are re-checked.
 
 create schema if not exists stetwise_private;
 revoke all on schema stetwise_private from public, anon, authenticated;
@@ -12,8 +19,11 @@ grant usage on schema stetwise_private to supabase_auth_admin;
 
 create table if not exists stetwise_private.oauth_resources (
   session_id uuid primary key references auth.sessions (id) on delete cascade,
-  resource text not null
+  resource text not null,
+  strict_match boolean not null default false
 );
+alter table stetwise_private.oauth_resources
+  add column if not exists strict_match boolean not null default false;
 revoke all on table stetwise_private.oauth_resources from public, anon, authenticated;
 grant select, insert, update on table stetwise_private.oauth_resources to supabase_auth_admin;
 
@@ -27,6 +37,12 @@ grant select on table stetwise_private.settings to supabase_auth_admin;
 insert into stetwise_private.settings (key, value)
 values ('mcp_resource', 'http://localhost:3000/mcp')
 on conflict (key) do nothing;
+
+-- The hook runs as supabase_auth_admin and reads auth.oauth_authorizations.
+-- A missing select fails the lookup, the hook returns the original event, and
+-- every OAuth token stays aud "authenticated", so /mcp rejects it.
+grant usage on schema auth to supabase_auth_admin;
+grant select on table auth.oauth_authorizations to supabase_auth_admin;
 
 -- Lowercase the scheme and host only. A trailing slash, query, fragment, or
 -- different path stays different so it cannot match the configured URL.
@@ -86,10 +102,12 @@ declare
   claims jsonb := coalesce(event->'claims', '{}'::jsonb);
   cid text := claims->>'client_id';
   sid uuid;
+  uid uuid;
   expected text;
   wanted text;
-  requested text;
-  got text;
+  trusted text;
+  open_count int;
+  bad_count int;
 begin
   if cid is null or btrim(cid) = '' then
     return original;
@@ -106,45 +124,48 @@ begin
 
     begin
       sid := nullif(btrim(claims->>'session_id'), '')::uuid;
+      uid := nullif(btrim(claims->>'sub'), '')::uuid;
     exception when others then
       return original;
     end;
-    if sid is null then
+    if sid is null or uid is null then
       return original;
     end if;
 
-    select r.resource into requested
+    -- Refresh trusts only a row this rule wrote, and only while it still matches the setting.
+    select r.resource into trusted
       from stetwise_private.oauth_resources r
-     where r.session_id = sid;
-    if requested is not null and stetwise_private.normalize_mcp_resource(requested) is distinct from wanted then
-      requested := null;
-    end if;
+     where r.session_id = sid
+       and r.strict_match
+       and stetwise_private.normalize_mcp_resource(r.resource) = wanted;
 
-    if requested is null then
-      select a.resource into requested
+    if trusted is null then
+      select count(*)::int,
+             count(*) filter (
+               where stetwise_private.normalize_mcp_resource(a.resource) is distinct from wanted
+             )::int
+        into open_count, bad_count
         from auth.oauth_authorizations a
        where a.client_id = cid::uuid
-         and a.user_id = nullif(claims->>'sub', '')::uuid
+         and a.user_id = uid
          and a.status::text = 'approved'
-         and a.expires_at > now()
-       order by a.created_at desc
-       limit 1;
-      got := stetwise_private.normalize_mcp_resource(requested);
-      if got is not null and got = wanted then
+         and a.expires_at > now();
+
+      if open_count > 0 and bad_count = 0 then
         begin
-          insert into stetwise_private.oauth_resources (session_id, resource)
-          values (sid, expected)
-          on conflict (session_id) do update set resource = excluded.resource;
+          insert into stetwise_private.oauth_resources (session_id, resource, strict_match)
+          values (sid, expected, true)
+          on conflict (session_id) do update
+            set resource = excluded.resource,
+                strict_match = true;
         exception when others then
           null;
         end;
-        requested := expected;
-      else
-        requested := null;
+        trusted := expected;
       end if;
     end if;
 
-    if requested is not null and stetwise_private.normalize_mcp_resource(requested) = wanted then
+    if trusted is not null then
       claims := jsonb_set(claims, '{aud}', jsonb_build_array('authenticated', expected));
       return jsonb_set(original, '{claims}', claims);
     end if;
