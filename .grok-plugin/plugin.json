@@ -1,0 +1,13 @@
+{
+  "name": "ouroboros-stetwise",
+  "displayName": "Stetwise by Ouroboros",
+  "version": "0.1.0",
+  "description": "Stetwise by Ouroboros edits Excel and Word files with a preview, a verification report, and undo. Sign in with your Stetwise account on first connect.",
+  "author": {
+    "name": "Ouroboros",
+    "email": "ouroborosplugins@gmail.com"
+  },
+  "repository": "https://github.com/LAHutchins91/stetwise-mcp",
+  "license": "MIT",
+  "keywords": ["stetwise", "excel", "word", "ouroboros"]
+}

@@ -1,0 +1,4 @@
+{
+  "framework": "express",
+  "crons": [{ "path": "/internal/purge", "schedule": "0 * * * *" }]
+}
