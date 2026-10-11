@@ -1,0 +1,16 @@
+{
+  "name": "io.github.LAHutchins91/stetwise",
+  "title": "Stetwise by Ouroboros",
+  "description": "Safe, reversible Excel and Word edits for ChatGPT, Claude, Cursor, and Grok. Every write is previewed, verified, and undoable.",
+  "version": "0.1.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://stetwise.app/mcp"
+    }
+  ],
+  "repository": {
+    "url": "https://github.com/LAHutchins91/stetwise-mcp",
+    "source": "github"
+  }
+}

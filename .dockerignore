@@ -1,0 +1,9 @@
+node_modules
+dist
+.git
+.env
+.data
+.pytest_cache
+**/__pycache__
+engine/.venv
+.vercel

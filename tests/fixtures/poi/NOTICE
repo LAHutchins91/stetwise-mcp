@@ -1,0 +1,7 @@
+Sample workbooks and documents in this directory come from the Apache POI
+project, commit ae62bb5116b9aee19ebd5834e3a82066132c9f7f:
+
+https://github.com/apache/poi/tree/ae62bb5116b9aee19ebd5834e3a82066132c9f7f/test-data
+
+They are licensed under the Apache License, Version 2.0. See LICENSE in this
+directory. They are test fixtures only and are not part of the Stetwise runtime.

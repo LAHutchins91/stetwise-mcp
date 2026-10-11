@@ -1,0 +1,13 @@
+{
+  "name": "stetwise",
+  "displayName": "Stetwise by Ouroboros",
+  "version": "0.1.0",
+  "description": "Stetwise by Ouroboros previews, applies, and undoes Excel and Word edits from Cursor and other MCP assistants. Sign in with your Stetwise account. No API key.",
+  "author": {
+    "name": "Ouroboros"
+  },
+  "repository": "https://github.com/LAHutchins91/stetwise-mcp",
+  "license": "MIT",
+  "keywords": ["excel", "word", "ooxml", "xlsx", "docx", "undo", "mcp", "stetwise"],
+  "publisher": "Ouroboros"
+}
