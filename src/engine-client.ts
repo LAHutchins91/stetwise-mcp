@@ -28,12 +28,15 @@ export function engineAuthHeaders(secret: string, body: Buffer, now = Date.now()
   const timestamp = String(Math.floor(now / 1000));
   const nonce = crypto.randomBytes(16).toString("hex");
   const signature = crypto.createHmac("sha256", secret).update(`${timestamp}.${nonce}.`).update(body).digest("hex");
-  return {
+  const headers: Record<string, string> = {
     "content-type": "application/json",
     "x-stetwise-timestamp": timestamp,
     "x-stetwise-nonce": nonce,
     "x-stetwise-signature": signature
   };
+  const bypass = process.env.ENGINE_BYPASS;
+  if (bypass) headers["x-vercel-protection-bypass"] = bypass;
+  return headers;
 }
 
 async function callHttp(payload: Record<string, unknown>): Promise<unknown> {

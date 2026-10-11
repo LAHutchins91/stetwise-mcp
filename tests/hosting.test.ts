@@ -29,6 +29,7 @@ describe("hosting", () => {
   afterEach(() => {
     delete process.env.ENGINE_URL;
     delete process.env.ENGINE_HMAC_SECRET;
+    delete process.env.ENGINE_BYPASS;
     delete process.env.CRON_SECRET;
   });
 
@@ -130,8 +131,41 @@ describe("hosting", () => {
       expect(headers["x-stetwise-nonce"]).toMatch(/^[a-f0-9]{32}$/);
       expect(heard[0].headers["x-stetwise-timestamp"]).toMatch(/^\d+$/);
       expect(String(heard[0].headers["x-stetwise-nonce"]).length).toBeGreaterThanOrEqual(16);
+      expect(heard[0].headers["x-vercel-protection-bypass"]).toBeUndefined();
       expect(heard[0].body).not.toContain("data_b64");
     } finally {
+      await new Promise<void>((resolve) => engine.close(() => resolve()));
+    }
+  });
+
+  it("sends the Vercel protection bypass header when ENGINE_BYPASS is set and does not log it", async () => {
+    const secret = "bypass-value-do-not-log";
+    const logs: string[] = [];
+    const original = console.log;
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((item) => String(item)).join(" "));
+    };
+    const heard: http.IncomingHttpHeaders[] = [];
+    const engine = http.createServer((req, res) => {
+      heard.push(req.headers);
+      res.writeHead(200).end(JSON.stringify({ ok: true, result: { stored: true } }));
+    });
+    engine.listen(0, "127.0.0.1");
+    await once(engine, "listening");
+    const address = engine.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    process.env.ENGINE_URL = `http://127.0.0.1:${port}`;
+    process.env.ENGINE_HMAC_SECRET = "engine-secret";
+    process.env.ENGINE_BYPASS = secret;
+    try {
+      const result = await engineCall<{ stored: boolean }>({ action: "inspect", filename: "book.xlsx" });
+      expect(result.stored).toBe(true);
+      expect(heard[0]["x-vercel-protection-bypass"]).toBe(secret);
+      const written = logs.join("\n");
+      expect(written).not.toContain(secret);
+      expect(written).not.toContain("x-vercel-protection-bypass");
+    } finally {
+      console.log = original;
       await new Promise<void>((resolve) => engine.close(() => resolve()));
     }
   });

@@ -54,6 +54,7 @@ See `.env.example`. Names only:
 | `STRIPE_PRICE_YEARLY` | Existing yearly price `price_1UPB0953QnCs3zydvFaCDgDw`. Used when the yearly plan is selected. |
 | `APP_BASE_URL` | Public origin. MCP resource is `{APP_BASE_URL}/mcp`. |
 | `ENGINE_URL`, `ENGINE_HMAC_SECRET` | Engine container. Unset `ENGINE_URL` uses the local Python module and sends file bytes as base64. When set, the server sends signed Storage URLs and object keys. The signature covers `timestamp.nonce.body`. |
+| `ENGINE_BYPASS` | Optional. When set, engine HTTP calls send it as `x-vercel-protection-bypass` so the MCP server can reach a protected engine. The value is not logged. |
 | `STETWISE_STORE` | `local` keeps `STETWISE_DATA_DIR`. Unset, with Supabase keys, uses Postgres and Storage. `ENGINE_URL` requires this store. |
 | `STETWISE_SIGNING_SECRET` | HMAC for local upload and download links. |
 | `STETWISE_PURGE_SECRET` | `POST /internal/purge` header `x-stetwise-purge`. |
@@ -102,8 +103,8 @@ Dev and tests use the local directory (`STETWISE_STORE=local`, or no Supabase ke
 Hosted state uses the Supabase project you create. This repository does not create the project, the bucket, or any Stripe object.
 
 1. Create a Supabase project and copy the project URL, anon key, and service role key into the host environment. The service role key stays on the server.
-2. Open the SQL editor and run `supabase/schema.sql`. That creates `profiles`, `usage_monthly`, `files`, `file_versions`, `proposals`, `upload_nonces`, `audit_events`, and `support_requests`, plus the private Storage bucket `stetwise-files`.
-3. Confirm the bucket is private. Content blobs are stored at `{user_id}/{sha256}`. Client uploads land at `{user_id}/incoming/{nonce}` and engine output lands at `{user_id}/stage/{uuid}` until the server copies them onto the content key. The service role stays on the MCP server. Clients and the engine use 15-minute signed URLs.
+2. Open the SQL editor and run `supabase/schema.sql`. That creates `profiles`, `usage_monthly`, `files`, `file_versions`, `proposals`, `upload_nonces`, `audit_events`, and `support_requests`, plus the private Storage bucket `stetwise-files`. Running it again is safe: it updates the bucket in place. The bucket `file_size_limit` is 25 MiB (26214400 bytes). `support_requests` has row level security and no policies, so anon and authenticated roles have no access; the service role writes it. Stetwise functions pin `search_path` to `public, pg_temp`.
+3. Confirm the bucket is private and the file size limit is 25 MiB. Content blobs are stored at `{user_id}/{sha256}`. Client uploads land at `{user_id}/incoming/{nonce}` and engine output lands at `{user_id}/stage/{uuid}` until the server copies them onto the content key. The service role stays on the MCP server. Clients and the engine use 15-minute signed URLs.
 4. Set `STETWISE_STORE` unset (or anything other than `local`) on the host so the server uses this adapter. Keep `STETWISE_STORE=local` for laptops and tests.
 5. Schedule purge at least once an hour. Vercel Cron calls `GET /internal/purge` with `Authorization: Bearer $CRON_SECRET`. `POST /internal/purge` with header `x-stetwise-purge: $STETWISE_PURGE_SECRET` remains. Expired files, expired proposals, and blobs nothing references are removed. In-progress `incoming/` and `stage/` objects younger than 2 hours are kept. Default retention is 24 hours after last use. `set_retention` can set 168 hours.
 

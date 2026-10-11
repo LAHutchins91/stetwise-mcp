@@ -107,6 +107,10 @@ alter table public.file_versions enable row level security;
 alter table public.proposals enable row level security;
 alter table public.upload_nonces enable row level security;
 alter table public.audit_events enable row level security;
+-- No policies. anon and authenticated cannot read or write. The service role bypasses row level security.
+alter table public.support_requests enable row level security;
+revoke all on table public.support_requests from public, anon, authenticated;
+grant select, insert, update, delete on table public.support_requests to service_role;
 
 drop policy if exists profiles_owner on public.profiles;
 create policy profiles_owner on public.profiles
@@ -123,9 +127,12 @@ create policy versions_owner on public.file_versions
     select 1 from public.files where files.id = file_versions.file_id and files.owner_id = auth.uid()
   ));
 
-insert into storage.buckets (id, name, public)
-values ('stetwise-files', 'stetwise-files', false)
-on conflict (id) do nothing;
+-- 25 MiB (25 × 1024 × 1024). Re-applying updates an existing bucket.
+insert into storage.buckets (id, name, public, file_size_limit)
+values ('stetwise-files', 'stetwise-files', false, 26214400)
+on conflict (id) do update
+set public = false,
+    file_size_limit = excluded.file_size_limit;
 
 -- Blobs live at {user_id}/{sha256} in the private stetwise-files bucket.
 -- The service role writes them. Clients receive only signed download links from the MCP server.
@@ -136,7 +143,7 @@ create or replace function public.stetwise_lock_profile(p_owner uuid)
 returns public.profiles
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   found_profile public.profiles;
@@ -157,6 +164,7 @@ create or replace function public.stetwise_usage_units(p_size integer)
 returns integer
 language sql
 immutable
+set search_path = public, pg_temp
 as $$
   select case
     when p_size is null or p_size <= 0 then 1
@@ -176,7 +184,7 @@ create or replace function public.stetwise_bump(
 ) returns integer
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   used integer;
@@ -246,7 +254,7 @@ create or replace function public.stetwise_reserve_upload(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   used integer;
@@ -281,7 +289,7 @@ create or replace function public.stetwise_commit_file(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   profile public.profiles;
@@ -351,7 +359,7 @@ create or replace function public.stetwise_save_proposal(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   profile public.profiles;
@@ -411,7 +419,7 @@ create or replace function public.stetwise_publish_edit(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   profile public.profiles;
@@ -502,7 +510,7 @@ create or replace function public.stetwise_restore(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   profile public.profiles;
@@ -569,7 +577,7 @@ create or replace function public.stetwise_record_recalculation(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   used_edits integer;
@@ -603,7 +611,7 @@ create or replace function public.stetwise_record_read(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   used_edits integer;
@@ -630,7 +638,7 @@ create or replace function public.stetwise_set_retention(p_owner uuid, p_hours i
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   profile public.profiles;
@@ -662,7 +670,7 @@ create or replace function public.stetwise_purge(p_now timestamptz)
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   file_count integer;
@@ -725,6 +733,21 @@ begin
   return jsonb_build_object('files', file_count, 'drop', dropped, 'keep', kept);
 end;
 $$;
+
+-- Pin every Stetwise function, including one created before search_path was set. Idempotent.
+do $$
+declare
+  fn regprocedure;
+begin
+  for fn in
+    select p.oid::regprocedure
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.proname like 'stetwise_%'
+  loop
+    execute format('alter function %s set search_path = public, pg_temp', fn);
+  end loop;
+end $$;
 
 do $$
 declare

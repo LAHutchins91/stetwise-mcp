@@ -212,6 +212,12 @@ describe("supabase store", () => {
   it("declares the private bucket, retention window, and service-role functions", () => {
     const sql = fs.readFileSync(path.join(repoRoot(), "supabase/schema.sql"), "utf8");
     expect(sql).toContain("stetwise-files");
+    expect(sql).toContain("file_size_limit");
+    expect(sql).toContain("26214400");
+    expect(sql).toContain("alter table public.support_requests enable row level security");
+    expect(sql).toContain("revoke all on table public.support_requests from public, anon, authenticated");
+    expect(sql).not.toMatch(/grant [^;]* on table public\.support_requests to anon/i);
+    expect(sql).toContain("set search_path = public, pg_temp");
     expect(sql).toContain("false");
     expect(sql).toContain("retention_hours in (24, 168)");
     for (const name of ["stetwise_commit_file", "stetwise_publish_edit", "stetwise_restore", "stetwise_purge", "stetwise_set_retention"]) {
