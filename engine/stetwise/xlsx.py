@@ -179,7 +179,12 @@ def _sheet_by_name(package: Package, name: str) -> SheetInfo:
 
 
 def _protected(xml: bytes) -> bool:
-    return b"<sheetProtection" in xml or b"<workbookProtection" in xml
+    if b"<sheetProtection" in xml:
+        return True
+    # LibreOffice writes an empty workbookProtection element on a new workbook.
+    # That does not lock structure or cells. A real lock carries attributes.
+    match = re.search(br"<workbookProtection\b([^>/]*)/?>", xml)
+    return bool(match and match.group(1).strip())
 
 
 def _pivot_boxes(package: Package) -> list[dict]:
@@ -242,7 +247,17 @@ def _table_boxes(package: Package) -> list[dict]:
         root = parse_xml(data, name)
         if local(root.tag) != "table":
             continue
-        boxes.append({"name": root.get("displayName") or root.get("name") or name, "ref": root.get("ref") or "", "part": name})
+        header = root.get("headerRowCount")
+        totals = root.get("totalsRowCount")
+        boxes.append(
+            {
+                "name": root.get("displayName") or root.get("name") or name,
+                "ref": root.get("ref") or "",
+                "part": name,
+                "header_rows": int(header) if header and header.isdigit() else 1,
+                "total_rows": int(totals) if totals and totals.isdigit() else 0,
+            }
+        )
     # Attribute tables to sheets via relationships when possible.
     sheet_of: dict[str, str] = {}
     for sheet in sheet_map(package):
@@ -303,7 +318,7 @@ def inspect_xlsx(package: Package) -> dict:
     if _chart_parts(package):
         features.append("charts and drawings (kept, not edited)")
     if any(entry.name.startswith("xl/tables/") for entry in package.entries):
-        features.append("Excel tables (kept, not edited)")
+        features.append("Excel tables (body cells can be edited; header, totals, and table XML stay)")
     if any(entry.name == "xl/vbaProject.bin" for entry in package.entries):
         features.append("vba project (kept byte-for-byte, never executed)")
     if any("externalLink" in entry.name for entry in package.entries):
@@ -318,7 +333,7 @@ def inspect_xlsx(package: Package) -> dict:
         "has_vba": any(entry.name == "xl/vbaProject.bin" for entry in package.entries),
         "workbook_protected": b"<workbookProtection" in parts["xl/workbook.xml"],
         "features_left_standing": features,
-        "recalc": "not_in_v1",
+        "recalc": "libreoffice_on_copy",
     }
 
 
@@ -398,7 +413,7 @@ def read_range(package: Package, sheet_name: str, ref: str | None, limit: int = 
         "range": ref or _used_range([cell["ref"] for cell in cells]),
         "cells": selected[:limit],
         "truncated": truncated,
-        "recalc": "LibreOffice recalculation is not in v1. cached_value_status present_unchecked means a cached number is stored and has not been recomputed.",
+        "recalc": "Cached values are not refreshed by read. recalculate previews LibreOffice results on a copy.",
     }
 
 
@@ -527,6 +542,7 @@ def set_cells(package: Package, sheet_name: str, cells: list[dict]) -> EditResul
     rendered: dict[str, bytes] = {}
     changes = []
     formula_touched = False
+    saw_table_body = False
     for spec in cells:
         ref = str(spec.get("ref") or "").replace("$", "")
         if not re.fullmatch(r"[A-Za-z]{1,3}\d+", ref):
@@ -543,12 +559,25 @@ def set_cells(package: Package, sheet_name: str, cells: list[dict]) -> EditResul
                     f"Cell {ref} is inside pivot table {box['name']} ({box['ref']}). v1 will not rewrite a pivot layout.",
                     "pivot_cell",
                 )
+        from .xlsx_ops import release_shared, table_role
+
         for box in tables:
-            if cell_in_range(ref, box["ref"]):
+            role = table_role(box, ref)
+            if role == "header":
                 raise StetwiseRefusal(
-                    f"Cell {ref} is inside Excel table {box['name']} ({box['ref']}). v1 will not rewrite table XML.",
-                    "table_cell",
+                    f"Cell {ref} is in the header of Excel table {box['name']} ({box['ref']}). Header edits would rewrite table XML, so v1 leaves that row alone.",
+                    "table_header",
                 )
+            if role == "totals":
+                raise StetwiseRefusal(
+                    f"Cell {ref} is in the totals row of Excel table {box['name']} ({box['ref']}). Totals edits would rewrite table XML, so v1 leaves that row alone.",
+                    "table_totals",
+                )
+            if role == "body" and not saw_table_body:
+                warnings.append(
+                    f"Excel table {box['name']} body cells can change. table XML, the header, and the totals row were not rewritten."
+                )
+                saw_table_body = True
         for merge in merges:
             if cell_in_range(ref, merge):
                 origin = merge.split(":")[0].replace("$", "")
@@ -559,10 +588,13 @@ def set_cells(package: Package, sheet_name: str, cells: list[dict]) -> EditResul
                     )
         before = existing.get(ref)
         if before and before.get("formula_type") == "shared":
-            raise StetwiseRefusal(
-                f"Cell {ref} is part of a shared formula group. v1 will not split that group.",
-                "shared_formula",
-            )
+            xml, shared_notes = release_shared(xml, ref)
+            for note in shared_notes:
+                changes.append({"ref": note["ref"], "before": {"shared": True}, "after": note})
+            if shared_notes and "Shared formula" not in " ".join(warnings):
+                warnings.append(
+                    "A shared formula group was split or had its master moved so this cell could change. Other cells keep an equivalent formula."
+                )
         formula = spec.get("formula") if "formula" in spec else None
         value = spec.get("value") if "value" in spec else None
         if formula is None and "formula" not in spec and "value" not in spec:
@@ -584,7 +616,7 @@ def set_cells(package: Package, sheet_name: str, cells: list[dict]) -> EditResul
         new_xml = _write_cell(new_xml, ref, inner, t_value)
     new_xml = _expand_dimension(new_xml, list(rendered))
     result = EditResult(warnings=warnings, diff=[{"op": "set_cells", "sheet": sheet.name, "changes": changes}])
-    if new_xml != xml:
+    if new_xml != parts[sheet.path]:
         result.replacements[sheet.path] = new_xml
     if formula_touched:
         workbook = _enable_full_calc(parts["xl/workbook.xml"])
@@ -604,7 +636,7 @@ def set_cells(package: Package, sheet_name: str, cells: list[dict]) -> EditResul
             result.replacements["xl/_rels/workbook.xml.rels"] = new_rels
             result.replacements["[Content_Types].xml"] = new_types
         result.warnings.append(
-            "Formula cached values were cleared and fullCalcOnLoad was set. v1 does not recalculate; Excel recalculates on open. LibreOffice preview is not in v1."
+            "Formula cached values were cleared and fullCalcOnLoad was set. Use recalculate to preview LibreOffice values before Excel opens the file."
         )
     if not result.replacements and not result.drop:
         raise StetwiseRefusal("The edit did not change any cell.", "empty_edit")
@@ -656,7 +688,10 @@ def _insert_missing_cell(xml: bytes, ref: str, cell_xml: bytes) -> bytes:
             return xml[:start] + new_row + xml[start:]
     marker = xml.find(b"</sheetData>")
     if marker < 0:
-        raise StetwiseRefusal("The worksheet has no sheetData element, so v1 will not invent one.", "malformed_xml")
+        empty = re.search(br"<sheetData\b[^>]*/>", xml)
+        if not empty:
+            raise StetwiseRefusal("The worksheet has no sheetData element, so v1 will not invent one.", "malformed_xml")
+        return xml[: empty.start()] + b"<sheetData>" + new_row + b"</sheetData>" + xml[empty.end() :]
     return xml[:marker] + new_row + xml[marker:]
 
 
@@ -835,6 +870,18 @@ def _insert(package: Package, sheet_name: str, shift: Shift, op: str) -> EditRes
         }
     )
     return result
+
+
+def replace_text(package: Package, find: str, replace: str, occurrence: int | None = None) -> EditResult:
+    from .xlsx_ops import replace_text as _replace_text
+
+    return _replace_text(package, find, replace, occurrence)
+
+
+def format_cells(package: Package, sheet_name: str, refs: list, options: dict) -> EditResult:
+    from .xlsx_ops import format_cells as _format_cells
+
+    return _format_cells(package, sheet_name, refs, options)
 
 
 def _rewrite_sheet_formulas_only(xml: bytes, home: str, shift: Shift) -> bytes | None:

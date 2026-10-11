@@ -1,8 +1,11 @@
-# File-processing core. LibreOffice is intentionally not installed: v1 does not
-# recalculate or render. A later image can FROM this one and add soffice.
+# File-processing core. LibreOffice recalculates a copy; the engine patches
+# cached values back into the original package and discards the LibreOffice save.
 FROM python:3.12-slim
 
 WORKDIR /app
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends libreoffice-calc python3-uno \
+  && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY stetwise ./stetwise

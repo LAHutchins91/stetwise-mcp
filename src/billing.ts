@@ -23,7 +23,8 @@ export function checkoutForm(input: {
   params.set("subscription_data[metadata][supabase_user_id]", input.userId);
   params.set("subscription_data[metadata][stripe_product_id]", stripeProductId());
   params.set("subscription_data[trial_period_days]", "14");
-  params.set("payment_method_collection", "always");
+  params.set("payment_method_collection", "if_required");
+  params.set("subscription_data[trial_settings][end_behavior][missing_payment_method]", "cancel");
   params.set("success_url", `${input.baseUrl}/?checkout=success`);
   params.set("cancel_url", `${input.baseUrl}/?checkout=cancelled`);
   if (input.customerId) params.set("customer", input.customerId);

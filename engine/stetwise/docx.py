@@ -1,8 +1,8 @@
 """Word .docx reads and run-aware text edits.
 
-Edits change w:t text nodes in word/document.xml and leave every other part
-byte-for-byte identical. Documents with track-changes currently turned on, or
-with document protection, are refused rather than rewritten.
+Direct edits change w:t text nodes in word/document.xml. When track changes
+are already on, or the caller asks for track_changes, the same edit is written
+as w:ins and w:del by Stetwise. Protected documents are still refused.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from lxml import etree
 
 from .errors import StetwiseRefusal
-from .xmlutil import all_named, local, parse_xml, reject_controls, replace_word_texts, word_text_spans
+from .xmlutil import all_named, local, parse_xml, reject_controls, replace_word_texts, word_text_spans, xml_escape
 from .zippack import Package
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -201,16 +201,11 @@ def search_docx(package: Package, query: str, limit: int = 50) -> dict:
     return {"matches": hits[:limit], "truncated": len(hits) > limit}
 
 
-def _refuse_tracking(package: Package) -> None:
+def _refuse_protected(package: Package) -> None:
     if protected(package):
         raise StetwiseRefusal(
             "This document is protected. v1 will not bypass document protection.",
             "protected",
-        )
-    if tracking_on(package):
-        raise StetwiseRefusal(
-            "This document has track changes turned on. v1 does not write new revision marks, and it will not bypass tracking with a direct edit. Existing revisions were not modified.",
-            "track_revisions",
         )
 
 
@@ -256,11 +251,17 @@ def _compose_piece_texts(pieces: list[dict], spans: list[tuple[int, int]], repla
     return outputs
 
 
-def replace_text(package: Package, find: str, replace: str, occurrence: int | None = None) -> EditResult:
+def replace_text(
+    package: Package, find: str, replace: str, occurrence: int | None = None, track_changes: bool = False
+) -> EditResult:
     if not find:
         raise StetwiseRefusal("The text to find is empty.", "empty_query")
     reject_controls(replace, "Replacement text")
-    _refuse_tracking(package)
+    _refuse_protected(package)
+    if tracking_on(package) or track_changes:
+        from .docx_ops import replace_text_tracked
+
+        return replace_text_tracked(package, find, replace, occurrence, track_changes)
     xml = _document(package)
     root = parse_xml(xml, "word/document.xml")
     _ensure_text_index(xml, root)
@@ -295,9 +296,9 @@ def replace_text(package: Package, find: str, replace: str, occurrence: int | No
             start = found + len(find)
         chosen = []
         for span in spans:
+            seen += 1
             if occurrence is None or seen == occurrence:
                 chosen.append(span)
-            seen += 1
         if not chosen:
             continue
         safe: list[tuple[int, int]] = []
@@ -344,9 +345,13 @@ def replace_text(package: Package, find: str, replace: str, occurrence: int | No
     )
 
 
-def replace_paragraph(package: Package, anchor: str, text: str) -> EditResult:
+def replace_paragraph(package: Package, anchor: str, text: str, track_changes: bool = False) -> EditResult:
     reject_controls(text, "Paragraph text")
-    _refuse_tracking(package)
+    _refuse_protected(package)
+    if tracking_on(package) or track_changes:
+        from .docx_ops import replace_paragraph_tracked
+
+        return replace_paragraph_tracked(package, anchor, text, track_changes)
     match = re.fullmatch(r"p-(\d+)", anchor or "")
     if not match:
         raise StetwiseRefusal("Paragraph anchor must look like p-0.", "bad_anchor")
@@ -366,7 +371,20 @@ def replace_paragraph(package: Package, anchor: str, text: str) -> EditResult:
             )
     runs = _visible_runs(paragraph)
     if not runs:
-        raise StetwiseRefusal(f"Paragraph {anchor} has no text run to keep formatting from.", "unsafe_paragraph")
+        from .docx_ops import _paragraph as paragraph_bytes
+
+        _number, (start, end) = paragraph_bytes(xml, anchor)
+        para = xml[start:end]
+        close = para.find(b"</w:r>")
+        if close < 0:
+            raise StetwiseRefusal(f"Paragraph {anchor} has no text run to keep formatting from.", "unsafe_paragraph")
+        space = ' xml:space="preserve"' if text[:1].isspace() or (text and text[-1:].isspace()) else ""
+        injected = f"<w:t{space}>{xml_escape(text)}</w:t>".encode("utf-8")
+        return EditResult(
+            replacements={"word/document.xml": xml[:start] + para[:close] + injected + para[close:] + xml[end:]},
+            diff=[{"op": "replace_paragraph", "anchor": anchor, "style": _style_of(paragraph), "before": "", "after": text}],
+            warnings=["The empty paragraph kept its style. Text was added to its first run."],
+        )
     indexes = _global_t_index(root)
     before = _paragraph_text(paragraph)
     updates = {indexes[runs[0]]: text}
@@ -380,8 +398,12 @@ def replace_paragraph(package: Package, anchor: str, text: str) -> EditResult:
     )
 
 
-def update_table_cells(package: Package, table: int, cells: list[dict]) -> EditResult:
-    _refuse_tracking(package)
+def update_table_cells(package: Package, table: int, cells: list[dict], track_changes: bool = False) -> EditResult:
+    _refuse_protected(package)
+    if tracking_on(package) or track_changes:
+        from .docx_ops import update_table_cells_tracked
+
+        return update_table_cells_tracked(package, table, cells, track_changes)
     xml = _document(package)
     root = parse_xml(xml, "word/document.xml")
     _ensure_text_index(xml, root)
@@ -428,3 +450,62 @@ def update_table_cells(package: Package, table: int, cells: list[dict]) -> EditR
         replacements={"word/document.xml": replace_word_texts(xml, updates)},
         diff=[{"op": "update_table_cells", "changes": changes}],
     )
+
+
+def insert_paragraph(package: Package, anchor: str, text: str, track_changes: bool = False) -> EditResult:
+    from .docx_ops import insert_paragraph as write_paragraph
+
+    return write_paragraph(package, anchor, text, track_changes)
+
+
+def delete_paragraph(package: Package, anchor: str, track_changes: bool = False) -> EditResult:
+    from .docx_ops import delete_paragraph as remove_paragraph
+
+    return remove_paragraph(package, anchor, track_changes)
+
+
+def format_runs(
+    package: Package,
+    find: str,
+    bold: bool | None = None,
+    italic: bool | None = None,
+    underline: bool | None = None,
+    occurrence: int | None = None,
+) -> EditResult:
+    from .docx_ops import format_runs as write_format
+
+    return write_format(package, find, bold, italic, underline, occurrence)
+
+
+def list_comments(package: Package) -> dict:
+    parts = package.parts()
+    if "word/comments.xml" not in parts:
+        return {"comments": []}
+    root = parse_xml(parts["word/comments.xml"], "word/comments.xml")
+    document = parse_xml(_document(package), "word/document.xml")
+    anchors: dict[str, str] = {}
+    for number, paragraph in enumerate(_paragraphs(document)):
+        for node in paragraph.iter():
+            if local(node.tag) in {"commentRangeStart", "commentReference", "commentRangeEnd"}:
+                comment_id = node.get(f"{{{W}}}id") or node.get("id")
+                if comment_id is not None and comment_id not in anchors:
+                    anchors[comment_id] = f"p-{number}"
+    comments = []
+    for node in root.iter():
+        if local(node.tag) != "comment":
+            continue
+        comment_id = node.get(f"{{{W}}}id") or node.get("id")
+        texts = []
+        for text_node in node.iter():
+            if local(text_node.tag) == "t" and not _in_ancestor(text_node, {"del"}):
+                texts.append(text_node.text or "")
+        comments.append(
+            {
+                "id": comment_id,
+                "author": node.get(f"{{{W}}}author") or node.get("author"),
+                "date": node.get(f"{{{W}}}date") or node.get("date"),
+                "text": "".join(texts),
+                "anchor": anchors.get(comment_id or ""),
+            }
+        )
+    return {"comments": comments}

@@ -50,11 +50,14 @@ _XLSX_REMOVABLE = {"xl/calcChain.xml"}
 _DOCX_ALLOWED = {"word/document.xml"}
 
 
-def assert_allowed(report: dict, kind: str) -> None:
+def assert_allowed(report: dict, kind: str, extra: set[str] | None = None) -> None:
     from .errors import StetwiseRefusal
 
+    allowed_extra = extra or set()
     if kind in {"xlsx", "xlsm"}:
         for name in report["changed_parts"]:
+            if name in allowed_extra:
+                continue
             if not any(name == allowed or name.startswith(allowed) for allowed in _XLSX_ALLOWED):
                 raise StetwiseRefusal(
                     f"Internal check: {name} would have changed, which this edit is not allowed to touch. The edit was not saved.",
@@ -73,7 +76,8 @@ def assert_allowed(report: dict, kind: str) -> None:
             )
         return
     if kind == "docx":
-        unexpected = [name for name in report["changed_parts"] if name not in _DOCX_ALLOWED]
+        allowed = set(_DOCX_ALLOWED) | allowed_extra
+        unexpected = [name for name in report["changed_parts"] if name not in allowed]
         if unexpected or report["removed_parts"] or report["added_parts"]:
             raise StetwiseRefusal(
                 "Internal check: a Word edit would have touched more than word/document.xml. The edit was not saved.",

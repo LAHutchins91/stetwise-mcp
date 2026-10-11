@@ -33,6 +33,8 @@ describe("billing", () => {
     });
     const body = params.toString();
     expect(params.get("subscription_data[trial_period_days]")).toBe("14");
+    expect(params.get("payment_method_collection")).toBe("if_required");
+    expect(params.get("subscription_data[trial_settings][end_behavior][missing_payment_method]")).toBe("cancel");
     expect(params.get("line_items[0][price]")).toBe("price_1UPB0453QnCs3zydekVagtYa");
     expect(params.get("metadata[stripe_product_id]")).toBe("prod_VQ12q90uKDcoto");
     expect(body).not.toContain("price_data");

@@ -85,7 +85,7 @@ describe("MCP", () => {
     const listed = await rpc("tools/list", {}, 2);
     expect(listed.status).toBe(200);
     const names = (listed.json.result.tools as { name: string }[]).map((tool) => tool.name);
-    for (const name of ["inspect", "read", "search", "propose_edit", "apply_edit", "list_versions", "restore_version", "export", "start_upload", "import_file", "get_usage", "set_retention", "recalculate"]) {
+    for (const name of ["inspect", "read", "search", "propose_edit", "apply_edit", "list_versions", "restore_version", "export", "start_upload", "import_file", "create_file", "list_comments", "get_usage", "set_retention", "recalculate"]) {
       expect(names).toContain(name);
     }
     const importer = (listed.json.result.tools as { name: string; _meta?: Record<string, unknown> }[]).find((tool) => tool.name === "import_file");
@@ -214,12 +214,36 @@ describe("MCP", () => {
     expect(JSON.stringify(recalc.data)).toContain("does not bill overage");
     delete process.env.STETWISE_CAP_TRIAL_RECALCS;
     process.env.STETWISE_CAP_TRIAL_RECALCS = "20";
-    const unavailable = await call("recalculate", { file_id: fileId });
-    expect(unavailable.isError).toBe(true);
-    expect(JSON.stringify(unavailable.data)).toContain("LibreOffice");
+    const preview = await call("recalculate", { file_id: fileId });
+    expect(preview.isError, preview.text).toBe(false);
+    expect(JSON.stringify(preview.data)).toContain("LibreOffice");
     const usage = await call("get_usage", {});
-    expect((usage.data.recalculations as { used: number }).used).toBe(0);
+    expect((usage.data.recalculations as { used: number }).used).toBe(1);
+    if (preview.data.proposal_id) {
+      const applied = await call("apply_edit", { proposal_id: preview.data.proposal_id, base_version: preview.data.base_version });
+      expect(applied.isError, applied.text).toBe(false);
+      const undone = await call("restore_version", { file_id: fileId, version: 1 });
+      expect(undone.isError, undone.text).toBe(false);
+    }
     delete process.env.STETWISE_CAP_TRIAL_RECALCS;
+  });
+
+  it("creates a blank workbook and fills it through propose and apply", async () => {
+    const created = await call("create_file", { kind: "xlsx", filename: "notes.xlsx" });
+    expect(created.isError, created.text).toBe(false);
+    const fileId = String(created.data.file_id);
+    const proposed = await call("propose_edit", {
+      file_id: fileId,
+      ops: [{ op: "set_cells", sheet: "Sheet1", cells: [{ ref: "A1", value: "Ready" }] }]
+    });
+    expect(proposed.isError, proposed.text).toBe(false);
+    const applied = await call("apply_edit", { proposal_id: proposed.data.proposal_id, base_version: proposed.data.base_version });
+    expect(applied.isError, applied.text).toBe(false);
+    const readBack = await call("read", { file_id: fileId, sheet: "Sheet1", range: "A1" });
+    expect(readBack.isError, readBack.text).toBe(false);
+    expect(JSON.stringify(readBack.data)).toContain("Ready");
+    const undone = await call("restore_version", { file_id: fileId, version: 1 });
+    expect(undone.isError, undone.text).toBe(false);
   });
 
   it("keeps files 24 hours by default and can extend that to 7 days", async () => {

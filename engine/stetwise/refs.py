@@ -141,6 +141,92 @@ def _sheet_matches(token: str | None, home: str, shift: Shift) -> bool:
     return name.casefold() == shift.sheet.casefold()
 
 
+def offset_formula(formula: str, d_col: int, d_row: int) -> str:
+    """Move relative references by a fixed offset. Absolute references stay.
+
+    Used when a shared formula is copied from its master cell onto another cell.
+    """
+    if d_col == 0 and d_row == 0:
+        return formula
+    blocker = formula_blockers(formula)
+    if blocker:
+        raise StetwiseRefusal(
+            f"v1 will not split a shared formula that contains {blocker}.",
+            "unsafe_formula",
+        )
+    return _offset_walk(formula, d_col, d_row)
+
+
+def _offset_walk(formula: str, d_col: int, d_row: int) -> str:
+    out: list[str] = []
+    i = 0
+    length = len(formula)
+    while i < length:
+        char = formula[i]
+        if char == '"':
+            j = i + 1
+            while j < length:
+                if formula[j] == '"':
+                    if j + 1 < length and formula[j + 1] == '"':
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(formula[i:j])
+            i = j
+            continue
+        sheet, nxt = _read_sheet(formula, i)
+        if sheet is not None and nxt < length and formula[nxt] == "!":
+            body, after = _read_ref_body(formula, nxt + 1)
+            out.append(formula[i : nxt + 1])
+            if body is None:
+                i = nxt + 1
+                continue
+            out.append(_offset_body(body, d_col, d_row))
+            i = after
+            continue
+        body, after = _read_ref_body(formula, i)
+        if body is not None:
+            out.append(_offset_body(body, d_col, d_row))
+            i = after
+            continue
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+
+def _offset_body(body: str, d_col: int, d_row: int) -> str:
+    col = _COL_RANGE.fullmatch(body)
+    if col:
+        c1 = col_to_num(col.group(2)) + (0 if col.group(1) else d_col)
+        c2 = col_to_num(col.group(4)) + (0 if col.group(3) else d_col)
+        return f"{col.group(1)}{num_to_col(c1)}:{col.group(3)}{num_to_col(c2)}"
+    row = _ROW_RANGE.fullmatch(body)
+    if row:
+        r1 = int(row.group(2)) + (0 if row.group(1) else d_row)
+        r2 = int(row.group(4)) + (0 if row.group(3) else d_row)
+        if r1 < 1 or r2 < 1 or r1 > MAX_ROW or r2 > MAX_ROW:
+            raise StetwiseRefusal("A shared formula would move past the Excel grid.", "ref_overflow")
+        return f"{row.group(1)}{r1}:{row.group(3)}{r2}"
+    if ":" in body:
+        left, right = body.split(":", 1)
+        return _offset_cell(left, d_col, d_row) + ":" + _offset_cell(right, d_col, d_row)
+    return _offset_cell(body, d_col, d_row)
+
+
+def _offset_cell(cell: str, d_col: int, d_row: int) -> str:
+    match = _CELL.fullmatch(cell)
+    if not match:
+        raise StetwiseRefusal(f"Could not rewrite reference {cell!r}.", "unsafe_formula")
+    col_abs, col, row_abs, row_s = match.groups()
+    col_n = col_to_num(col) + (0 if col_abs else d_col)
+    row_n = int(row_s) + (0 if row_abs else d_row)
+    if col_n < 1 or col_n > MAX_COL or row_n < 1 or row_n > MAX_ROW:
+        raise StetwiseRefusal("A shared formula would move past the Excel grid.", "ref_overflow")
+    return f"{col_abs}{num_to_col(col_n)}{row_abs}{row_n}"
+
+
 def shift_formula(formula: str, home_sheet: str, shift: Shift) -> str:
     blocker = formula_blockers(formula)
     if blocker:

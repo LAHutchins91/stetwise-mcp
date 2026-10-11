@@ -9,7 +9,7 @@ from stetwise.engine import dispatch, propose, search, inspect
 from stetwise.errors import StetwiseRefusal
 from stetwise.refs import Shift, shift_formula
 from stetwise.zippack import read_package, write_package
-from build_fixtures import contract_docx, model_xlsx
+from build_fixtures import contract_docx, model_xlsx, settings_docx, stale_xlsx, strings_xlsx, table_xlsx
 
 POI = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "poi"
 
@@ -110,20 +110,22 @@ def test_set_cell_outside_pivot_keeps_pivot_and_table():
     assert b"<v>42</v>" in _part(edited, "xl/worksheets/sheet1.xml")
 
 
-def test_formula_edit_keeps_style_and_shared_formula_group():
+def test_formula_edit_keeps_style_and_splits_shared_formula_group():
     original = POI.joinpath("50755_workday_formula_example.xlsx").read_bytes()
-    with pytest.raises(StetwiseRefusal) as shared:
-        propose(original, "50755.xlsx", [{"op": "set_cells", "sheet": "Sheet1", "cells": [{"ref": "B3", "formula": "WORKDAY(A3,6)"}]}])
-    assert shared.value.code == "shared_formula"
-    result = _propose(original, "50755.xlsx", [{"op": "set_cells", "sheet": "Sheet1", "cells": [{"ref": "B2", "formula": "WORKDAY(A2,6)"}]}])
+    result = _propose(original, "50755.xlsx", [{"op": "set_cells", "sheet": "Sheet1", "cells": [{"ref": "B3", "formula": "WORKDAY(A3,6)"}]}])
     edited = _bytes(result)
     sheet = _part(edited, "xl/worksheets/sheet1.xml")
-    assert b'<c r="B2" s="2"><f>WORKDAY(A2,6)</f></c>' in sheet or b'r="B2" s="2"' in sheet
-    assert b"WORKDAY(A2,6)" in sheet
-    assert b't="shared"' in sheet
+    assert b"WORKDAY(A3,6)" in sheet
+    assert b"WORKDAY(A4,5)" in sheet
+    assert b't="shared"' not in sheet
+    assert b"<v>40584</v>" in sheet
     assert _compressed(edited, "xl/styles.xml") == _compressed(original, "xl/styles.xml")
     assert "xl/calcChain.xml" in result["verification"]["removed_parts"]
-    assert b'fullCalcOnLoad="1"' in _part(edited, "xl/workbook.xml")
+    plain = _propose(original, "50755.xlsx", [{"op": "set_cells", "sheet": "Sheet1", "cells": [{"ref": "B2", "formula": "WORKDAY(A2,6)"}]}])
+    plain_sheet = _part(_bytes(plain), "xl/worksheets/sheet1.xml")
+    assert b"WORKDAY(A2,6)" in plain_sheet
+    assert b't="shared"' in plain_sheet
+    assert _compressed(_bytes(plain), "xl/styles.xml") == _compressed(original, "xl/styles.xml")
 
 
 def test_cross_sheet_number_edit_leaves_other_sheets():
@@ -291,23 +293,31 @@ def test_table_cell_and_paragraph_style():
     assert _compressed(_bytes(result), "word/styles.xml") == _compressed(original, "word/styles.xml")
 
 
-def test_tracking_protection_and_comment_only_matches_are_refused():
-    for name in (
-        "delins.docx",
-        "bug56075-changeTracking_on.docx",
-        "documentProtection_trackedChanges_no_password.docx",
-    ):
-        blob = POI.joinpath(name).read_bytes()
-        with pytest.raises(StetwiseRefusal):
-            propose(blob, name, [{"op": "replace_text", "find": "Tika" if name == "delins.docx" else "a", "replace": "b"}])
+def test_tracking_writes_revisions_and_protection_is_still_refused():
+    tracked = POI.joinpath("delins.docx").read_bytes()
+    result = _propose(tracked, "delins.docx", [{"op": "replace_text", "find": "Tika", "replace": "Stetwise"}])
+    document = _part(_bytes(result), "word/document.xml")
+    assert b'w:author="Stetwise"' in document
+    assert b"<w:del" in document and b"<w:ins" in document
+    assert b"Tika" in document and b"Stetwise" in document
+    settings = "word/settings.xml"
+    if settings in read_package(tracked).parts():
+        assert _compressed(_bytes(result), settings) == _compressed(tracked, settings)
+    already = POI.joinpath("bug56075-changeTracking_on.docx").read_bytes()
+    revised = _propose(already, "bug56075-changeTracking_on.docx", [{"op": "replace_text", "find": "Tracking", "replace": "Marks"}])
+    body = _part(_bytes(revised), "word/document.xml")
+    assert b'w:author="Stetwise"' in body
+    assert b"Tracking" in body and b"Marks" in body
+    protected = POI.joinpath("documentProtection_trackedChanges_no_password.docx").read_bytes()
+    with pytest.raises(StetwiseRefusal) as exc:
+        propose(protected, "protected.docx", [{"op": "replace_text", "find": "a", "replace": "b"}])
+    assert exc.value.code == "protected"
     comments = POI.joinpath("comment.docx").read_bytes()
-    hits = search(comments, "comment.docx", "Unbekannter")
-    # The comment body is long; search for a word that exists in comments.xml.
     comment_xml = _part(comments, "word/comments.xml")
     assert b"<w:t" in comment_xml
-    with pytest.raises(StetwiseRefusal) as exc:
+    with pytest.raises(StetwiseRefusal) as missing:
         propose(comments, "comment.docx", [{"op": "replace_text", "find": "does-not-exist", "replace": "x"}])
-    assert exc.value.code == "not_found"
+    assert missing.value.code == "not_found"
 
 
 def test_comment_text_is_not_rewritten():
@@ -406,6 +416,140 @@ def test_dispatch_propose_round_trip():
     assert verified["result"]["untouched_identical"] is True
     assert "xl/styles.xml" not in verified["result"]["changed_parts"]
     recalc = dispatch({"action": "recalculate", "filename": "model.xlsx", "data_b64": _b64(original)})
-    assert recalc["ok"] is False
-    assert recalc["error"]["code"] == "unsupported"
-    assert "LibreOffice" in recalc["error"]["reason"]
+    assert recalc["ok"] is True
+    assert recalc["result"]["label"] == "LibreOffice-calculated"
+    assert recalc["result"]["changed"] is False
+
+
+def test_table_body_edits_leave_table_xml():
+    original = table_xlsx()
+    body = _propose(original, "table.xlsx", [{"op": "set_cells", "sheet": "Data", "cells": [{"ref": "B2", "value": 8}]}])
+    edited = _bytes(body)
+    assert b"<v>8</v>" in _part(edited, "xl/worksheets/sheet1.xml")
+    assert _compressed(edited, "xl/tables/table1.xml") == _compressed(original, "xl/tables/table1.xml")
+    with pytest.raises(StetwiseRefusal) as header:
+        propose(original, "table.xlsx", [{"op": "set_cells", "sheet": "Data", "cells": [{"ref": "A1", "value": "Name"}]}])
+    assert header.value.code == "table_header"
+    with pytest.raises(StetwiseRefusal) as totals:
+        propose(original, "table.xlsx", [{"op": "set_cells", "sheet": "Data", "cells": [{"ref": "B4", "value": 1}]}])
+    assert totals.value.code == "table_totals"
+
+
+def test_excel_replace_text_skips_formulas_and_shared_strings():
+    original = strings_xlsx()
+    result = _propose(original, "strings.xlsx", [{"op": "replace_text", "find": "Hello", "replace": "Hi"}])
+    edited = _bytes(result)
+    sheet = _part(edited, "xl/worksheets/sheet1.xml")
+    assert b">Hi</t>" in sheet
+    assert b">Hi world</t>" in sheet
+    assert b'<f>"Hello"</f>' in sheet
+    assert _compressed(edited, "xl/sharedStrings.xml") == _compressed(original, "xl/sharedStrings.xml")
+    second = _propose(original, "strings.xlsx", [{"op": "replace_text", "find": "Hello", "replace": "Hi", "occurrence": 2}])
+    once = _part(_bytes(second), "xl/worksheets/sheet1.xml")
+    assert once.count(b">Hi</t>") == 1
+    assert b">Hello</t>" in once or b"<v>0</v>" in once
+
+
+def test_format_cells_appends_styles_and_leaves_theme_bytes():
+    original = model_xlsx()
+    result = _propose(
+        original,
+        "model.xlsx",
+        [{"op": "format_cells", "sheet": "Inputs", "refs": ["A1"], "bold": True, "fill": "FFCC00", "number_format": "0.00", "horizontal": "right", "column_width": 18}],
+    )
+    edited = _bytes(result)
+    styles = _part(edited, "xl/styles.xml")
+    assert b"<b/>" in styles
+    assert b"FFCC00" in styles
+    assert b'horizontal="right"' in styles
+    assert b'width="18"' in _part(edited, "xl/worksheets/sheet1.xml")
+    assert b'<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' in styles
+    assert b"theme" not in styles.lower()
+    charts = POI.joinpath("123233_charts.xlsx").read_bytes()
+    painted = _propose(charts, "123233_charts.xlsx", [{"op": "format_cells", "sheet": "Page1_1", "refs": ["G45"], "italic": True}])
+    painted_bytes = _bytes(painted)
+    package = read_package(charts)
+    for name in package.parts():
+        if "/charts/" in name or "/drawings/" in name or "theme" in name:
+            assert _compressed(painted_bytes, name) == _compressed(charts, name), name
+    assert "xl/styles.xml" in painted["verification"]["changed_parts"]
+
+
+def test_recalculate_patches_cached_values_on_a_copy():
+    original = stale_xlsx()
+    response = dispatch({"action": "recalculate", "filename": "stale.xlsx", "data_b64": _b64(original)})
+    assert response["ok"] is True, response
+    result = response["result"]
+    assert result["changed"] is True
+    assert result["label"] == "LibreOffice-calculated"
+    edited = _bytes(result)
+    sheet = _part(edited, "xl/worksheets/sheet1.xml")
+    assert b"<f>A1+B1</f>" in sheet
+    assert b"<v>15</v>" in sheet
+    assert b"<f>A1/0</f>" in sheet
+    assert b't="e"' in sheet
+    assert b"#DIV/0!" in sheet
+    assert _compressed(edited, "xl/styles.xml") == _compressed(original, "xl/styles.xml")
+    assert result["verification"]["untouched_identical"] is True
+    word = dispatch({"action": "recalculate", "filename": "contract.docx", "data_b64": _b64(contract_docx())})
+    assert word["ok"] is False
+    assert word["error"]["code"] == "wrong_kind"
+
+
+def test_create_blank_then_edit_and_list_comments():
+    blank = dispatch({"action": "blank", "kind": "xlsx"})
+    assert blank["ok"] is True
+    assert blank["result"]["source"] == "LibreOffice"
+    workbook = _bytes(blank["result"])
+    edited = _propose(workbook, "blank.xlsx", [{"op": "set_cells", "sheet": "Sheet1", "cells": [{"ref": "A1", "value": "Ready"}]}])
+    assert b"Ready" in _part(_bytes(edited), "xl/worksheets/sheet1.xml")
+    document = dispatch({"action": "blank", "kind": "docx"})
+    assert document["ok"] is True
+    filled = _propose(_bytes(document["result"]), "blank.docx", [{"op": "replace_paragraph", "anchor": "p-0", "text": "Hello"}])
+    assert b"Hello" in _part(_bytes(filled), "word/document.xml")
+    comments = dispatch({"action": "list_comments", "filename": "comment.docx", "data_b64": _b64(POI.joinpath("comment.docx").read_bytes())})
+    assert comments["ok"] is True
+    first = comments["result"]["comments"][0]
+    assert first["author"] == "Unbekannter Autor"
+    assert "first line" in first["text"]
+    contract = dispatch({"action": "list_comments", "filename": "contract.docx", "data_b64": _b64(contract_docx())})
+    assert contract["result"]["comments"][0]["text"] == "Reviewer note stays"
+    assert contract["result"]["comments"][0]["anchor"] == "p-1"
+    workbook_comments = dispatch({"action": "list_comments", "filename": "model.xlsx", "data_b64": _b64(model_xlsx())})
+    assert workbook_comments["ok"] is False
+    assert workbook_comments["error"]["code"] == "wrong_kind"
+
+
+def test_word_paragraphs_tracking_and_run_format():
+    original = contract_docx()
+    inserted = _propose(original, "contract.docx", [{"op": "insert_paragraph", "anchor": "p-0", "text": "Added clause"}])
+    document = _part(_bytes(inserted), "word/document.xml")
+    assert b"Added clause" in document
+    assert b"Service agreement" in document
+    assert _compressed(_bytes(inserted), "word/styles.xml") == _compressed(original, "word/styles.xml")
+    removed = _propose(original, "contract.docx", [{"op": "delete_paragraph", "anchor": "p-0"}])
+    gone = _part(_bytes(removed), "word/document.xml")
+    assert b"Service agreement" not in gone
+    assert b"Acme" in gone
+    with pytest.raises(StetwiseRefusal) as only:
+        propose(original, "contract.docx", [{"op": "delete_paragraph", "anchor": "p-1"}])
+    assert only.value.code == "unsafe_paragraph"
+    overlap = original
+    with pytest.raises(StetwiseRefusal) as tracked:
+        propose(overlap, "contract.docx", [{"op": "replace_text", "find": "new fee", "replace": "other"}])
+    assert tracked.value.code == "tracked_change_overlap"
+    formatted = _propose(original, "contract.docx", [{"op": "format_runs", "find": "Acme", "bold": True, "underline": True}])
+    runs = _part(_bytes(formatted), "word/document.xml")
+    assert b"<w:u " in runs or b"<w:u/>" in runs
+    assert _compressed(_bytes(formatted), "word/styles.xml") == _compressed(original, "word/styles.xml")
+    assert _compressed(_bytes(formatted), "word/comments.xml") == _compressed(original, "word/comments.xml")
+    settings = settings_docx()
+    marked = _propose(settings, "settings.docx", [{"op": "replace_text", "find": "Beta", "replace": "Gamma", "track_changes": True}])
+    marked_doc = _part(_bytes(marked), "word/document.xml")
+    marked_settings = _part(_bytes(marked), "word/settings.xml")
+    assert b'w:author="Stetwise"' in marked_doc
+    assert b"<w:delText" in marked_doc or b"<w:del" in marked_doc
+    assert b"Gamma" in marked_doc
+    assert b"Alpha stay" in marked_doc
+    assert b"<w:trackRevisions" in marked_settings
+    assert "word/settings.xml" in marked["verification"]["changed_parts"]

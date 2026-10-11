@@ -24,7 +24,7 @@ Use the `file_id` from that response. Do not paste the workbook into the chat wh
 3. `apply_edit` with that `proposal_id` and the `base_version` token. A stale token means the file moved. Propose again. Do not reuse an old token.
 4. `export` returns a short-lived download link. `restore_version` undoes by creating a new head equal to an earlier version.
 
-`recalculate` does not run in v1. Say so. Do not invent cached values.
+`recalculate` runs LibreOffice on a copy and returns a preview of cached values. Apply that proposal to keep them. Do not invent cached values. `create_file` makes a blank workbook or document; fill it with `propose_edit`.
 
 ## Caps and retention
 
@@ -32,4 +32,4 @@ Use the `file_id` from that response. Do not paste the workbook into the chat wh
 
 ## Refusals
 
-If Stetwise refuses, the reason is the result. Do not retry a refused pivot, chart, shared-formula, protected, or track-changes edit by rewriting the file another way.
+If Stetwise refuses, the reason is the result. Do not retry a refused pivot, chart, protected sheet, table header, or overlapping tracked change by rewriting the file another way. Word edits on a document that already tracks changes are written as revisions by Stetwise. Pass `track_changes: true` to record revisions on a document that is not tracking yet.

@@ -124,30 +124,40 @@ Do not deploy from this repository. Do not create Stripe products or prices. Che
 ## What works in v1
 
 - Inspect, read a range or section, and search `.xlsx`, `.xlsm`, and `.docx`.
-- `propose_edit` then `apply_edit` for `set_cells`, `insert_rows`, `insert_cols`, `replace_text`, `replace_paragraph`, and `update_table_cells`.
+- `propose_edit` then `apply_edit` for `set_cells` (including Excel table body cells and shared formulas), `insert_rows`, `insert_cols`, Excel `replace_text` on text values, `format_cells`, Word `replace_text`, `replace_paragraph`, `update_table_cells`, `insert_paragraph`, `delete_paragraph`, and `format_runs`.
+- `create_file` for a blank `.xlsx` or `.docx`, then the same propose and apply flow.
+- `list_comments` to read Word comments without changing the file.
+- `recalculate` runs LibreOffice on a copy and previews cached formula values. Apply that proposal to keep them. Undo restores the previous bytes.
+- Word edits are direct when tracking is off. Pass `track_changes: true`, or edit a document that already has tracking on, and the same change is written as `w:ins` / `w:del` by Stetwise.
 - Versions, undo, and a signed download link.
 - ChatGPT file import (`import_file`) and a signed upload link for other clients.
-- OAuth metadata, consent, Stripe checkout with a 14-day trial, and the billing portal. Same account shape as Continuity.
+- OAuth metadata, consent, Stripe Checkout with a 14-day trial that does not require a card (`payment_method_collection=if_required`, missing payment method cancels at the end of the trial), and the billing portal. Same account shape as Continuity.
 - Byte-level refusal when a workbook or document cannot be edited safely. Untouched zip entries are copied with their original compressed bytes.
 
 ## Refused by design
 
-- PowerPoint, Google Drive, OneDrive, and edits of several files in one call.
+- Edits of several files in one call.
 - Legacy `.xls`, `.doc`, and `.ppt`, and encrypted or IRM files.
 - Running macros. `vbaProject.bin` is copied and never executed.
-- Creating or rewriting pivot tables, chart XML, slicers, or Excel tables.
-- Shared formulas, protected sheets, and the non-origin cell of a merge.
+- PowerPoint is a separate format. Placeholder and master slides would break the byte-for-byte proof, so v1 says Excel and Word.
+- Creating or rewriting pivot tables, chart XML, or slicers. Those parts stay byte-for-byte identical.
+- Excel table header rows, totals rows, and `table.xml`. Body cells can change.
+- Protected sheets and workbooks, and the non-origin cell of a merge.
 - Inserting rows or columns when the workbook has pivots, charts, drawings, tables, shared formulas, 3D references, macros, comments, or protection.
-- Word edits while track changes are on, or while the document is protected. v1 does not write new `w:ins` or `w:del` and does not turn tracking off.
-- Rewriting comments, headers, footers, footnotes, or endnotes.
-- LibreOffice recalculation and PDF or PNG previews. `recalculate` exists so the monthly cap is enforced, then refuses.
+- A shared formula whose master formula is missing. v1 will not invent it. A solid row or column can shrink or promote a neighbor; a cell in the middle is unshared into explicit formulas.
+- Word edits while the document is protected.
+- Rewriting an existing tracked change, or accepting and rejecting someone else's revisions.
+- Rewriting comments, headers, footers, footnotes, endnotes, `word/styles.xml`, or the theme. `list_comments` is read-only. `format_cells` and `format_runs` append or set direct formatting and leave the theme alone.
+- Excel `replace_text` on formula text. Only cached text values change, and `sharedStrings.xml` stays byte-for-byte identical.
+- PDF or PNG previews.
 - Private, loopback, and link-local download URLs.
+- Google Drive, OneDrive, and local disk access beyond the signed upload link.
 
 ## Known gaps
 
 - `supabase/schema.sql` is applied by you in the Supabase SQL editor. This repository does not create the project.
 - No Excel-saved golden file for row insert. The shifter follows Excel's reference rules and is tested on the hand-built model.
-- Formula edits clear the cached value and set `fullCalcOnLoad`. Chart caches and pivot caches are not refreshed.
+- Formula edits clear the cached value and set `fullCalcOnLoad` unless you call `recalculate`, which patches LibreOffice values from a copy. Chart caches and pivot caches are not refreshed.
 - The engine port must not be public. Require `ENGINE_HMAC_SECRET` and a network policy.
 - DNS rebinding between the address check and the connection is still possible. Hosts that resolve to private addresses are refused at check time.
 - `openpyxl` is not used. Whole-workbook saves drop shapes and pivots, so edits stay at the package and XML part.
