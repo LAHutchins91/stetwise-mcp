@@ -104,9 +104,18 @@ Hosted state uses the Supabase project you create. This repository does not crea
 
 1. Create a Supabase project and copy the project URL, anon key, and service role key into the host environment. The service role key stays on the server.
 2. Open the SQL editor and run `supabase/schema.sql`. That creates `profiles`, `usage_monthly`, `files`, `file_versions`, `proposals`, `upload_nonces`, `audit_events`, and `support_requests`, plus the private Storage bucket `stetwise-files`. Running it again is safe: it updates the bucket in place. The bucket `file_size_limit` is 25 MiB (26214400 bytes). `support_requests` has row level security and no policies, so anon and authenticated roles have no access; the service role writes it. Stetwise functions pin `search_path` to `public, pg_temp`.
-3. Confirm the bucket is private and the file size limit is 25 MiB. Content blobs are stored at `{user_id}/{sha256}`. Client uploads land at `{user_id}/incoming/{nonce}` and engine output lands at `{user_id}/stage/{uuid}` until the server copies them onto the content key. The service role stays on the MCP server. Clients and the engine use 15-minute signed URLs.
-4. Set `STETWISE_STORE` unset (or anything other than `local`) on the host so the server uses this adapter. Keep `STETWISE_STORE=local` for laptops and tests.
-5. Schedule purge at least once an hour. Vercel Cron calls `GET /internal/purge` with `Authorization: Bearer $CRON_SECRET`. `POST /internal/purge` with header `x-stetwise-purge: $STETWISE_PURGE_SECRET` remains. Expired files, expired proposals, and blobs nothing references are removed. In-progress `incoming/` and `stage/` objects younger than 2 hours are kept. Default retention is 24 hours after last use. `set_retention` can set 168 hours.
+3. Run `supabase/oauth_resource_binding.sql` in the SQL editor. Running it again is safe and does not overwrite the resource setting. Then set that setting to the exact MCP URL, `APP_BASE_URL` plus `/mcp`, with https, no trailing slash, and no query or fragment:
+
+```sql
+update stetwise_private.settings
+set value = 'https://YOUR_HOST/mcp'
+where key = 'mcp_resource';
+```
+
+In the dashboard open Authentication → Hooks → Custom Access Token and choose `public.stetwise_access_token_hook`. The hook adds that configured URL to `aud` (keeping `authenticated`, so `aud` is an array) only for an OAuth token whose requested resource is that same URL. Scheme and host case are normalized. A different host (`https://evil.example/mcp`), a different path, a trailing slash, `http://`, a query, a fragment, or a missing resource leaves `aud` as `authenticated`, and `/mcp` rejects the token. First-party session tokens are not changed. Disconnect and connect clients again after enabling the hook.
+4. Confirm the bucket is private and the file size limit is 25 MiB. Content blobs are stored at `{user_id}/{sha256}`. Client uploads land at `{user_id}/incoming/{nonce}` and engine output lands at `{user_id}/stage/{uuid}` until the server copies them onto the content key. The service role stays on the MCP server. Clients and the engine use 15-minute signed URLs.
+5. Set `STETWISE_STORE` unset (or anything other than `local`) on the host so the server uses this adapter. Keep `STETWISE_STORE=local` for laptops and tests.
+6. Schedule purge at least once an hour. Vercel Cron calls `GET /internal/purge` with `Authorization: Bearer $CRON_SECRET`. `POST /internal/purge` with header `x-stetwise-purge: $STETWISE_PURGE_SECRET` remains. Expired files, expired proposals, and blobs nothing references are removed. In-progress `incoming/` and `stage/` objects younger than 2 hours are kept. Default retention is 24 hours after last use. `set_retention` can set 168 hours.
 
 `profiles.id` references `auth.users`. Dev auth (`STETWISE_DEV_AUTH`) is for the local store only.
 
