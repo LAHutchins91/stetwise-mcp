@@ -53,18 +53,22 @@ See `.env.example`. Names only:
 | `STRIPE_PRICE_MONTHLY` | Existing monthly price `price_1UPB0453QnCs3zydekVagtYa`. This is the default Checkout price. |
 | `STRIPE_PRICE_YEARLY` | Existing yearly price `price_1UPB0953QnCs3zydvFaCDgDw`. Used when the yearly plan is selected. |
 | `APP_BASE_URL` | Public origin. MCP resource is `{APP_BASE_URL}/mcp`. |
-| `ENGINE_URL`, `ENGINE_HMAC_SECRET` | Engine container. Unset `ENGINE_URL` uses the local Python module. |
-| `STETWISE_STORE` | `local` keeps `STETWISE_DATA_DIR`. Unset, with Supabase keys, uses Postgres and Storage. |
-| `STETWISE_SIGNING_SECRET` | HMAC for upload and download links. |
+| `ENGINE_URL`, `ENGINE_HMAC_SECRET` | Engine container. Unset `ENGINE_URL` uses the local Python module and sends file bytes as base64. When set, the server sends signed Storage URLs and object keys. The signature covers `timestamp.nonce.body`. |
+| `STETWISE_STORE` | `local` keeps `STETWISE_DATA_DIR`. Unset, with Supabase keys, uses Postgres and Storage. `ENGINE_URL` requires this store. |
+| `STETWISE_SIGNING_SECRET` | HMAC for local upload and download links. |
 | `STETWISE_PURGE_SECRET` | `POST /internal/purge` header `x-stetwise-purge`. |
+| `CRON_SECRET` | `GET /internal/purge` bearer token. Vercel Cron sends this. |
 | `STETWISE_DEV_AUTH`, `STETWISE_DEV_TOKEN` | Local bearer. Refused in production. |
 | `STETWISE_PYTHON` | Python executable. Default `python3`. |
 | `STETWISE_DATA_DIR` | Local database directory when the store is local. Default `.data`. Dev and tests use this. |
 | `STETWISE_HTTP_ONLY` | Set to `1` on the HTTP host. |
-| `STETWISE_FILE_BASE_URL` | Public origin of the Node process that accepts file PUT and GET. Defaults to `APP_BASE_URL`. |
-| `STETWISE_ACCEPT_UPLOADS` | Set to `0` on Vercel so that process refuses file bodies. Leave unset on the Node container. |
+| `STETWISE_FILE_BASE_URL` | Local and dev origin for `/v1/upload` and `/v1/download`. Defaults to `APP_BASE_URL`. Hosted uploads and downloads use Supabase signed URLs instead. |
+| `STETWISE_ACCEPT_UPLOADS` | Set to `0` on Vercel so that process refuses file bodies. Leave unset for local and dev. |
+| `STETWISE_ENGINE_CONCURRENCY` | Engine worker processes. Default 2, clamped to 1–8. A full pool returns 429. `/health` does not take a slot. |
+| `STETWISE_ENGINE_MAX_BODY` | Max engine HTTP body. Default 4194304 (4 MiB). |
+| `STETWISE_ENGINE_MAX_OBJECT` | Max object the engine fetches or writes. Default 26214400. |
 | `OPENAI_APPS_CHALLENGE` | Optional ChatGPT domain check. |
-| `PORT` | HTTP port. Default `3000`. |
+| `PORT` | Node HTTP port, default `3000`. The engine reads the same variable and defaults to `8080`. |
 
 Checkout sends `line_items[0][price]` set to `STRIPE_PRICE_MONTHLY` or `STRIPE_PRICE_YEARLY`. It sets `subscription_data[trial_period_days]` to 14. It does not create a product or a price, and it does not send an amount. Stripe shows the amount. While `subscription_status` is `trialing`, the server enforces the trial caps below (100 applied edits, 20 recalculations, and 200 proposals), even if the Stripe plan name is already Pro. An `active` subscription uses the Pro caps. Past a cap the call is blocked. There is no overage charge.
 
@@ -87,7 +91,7 @@ Monthly caps, overridable without a code change:
 
 Each started 5 MB of a file counts as one unit toward files, applied edits, recalculations, and proposals. A 25 MB file counts as 5. A call that would pass the cap is blocked entirely. Trial file cap defaults to 25 new files per UTC month. Pro is 250. A trialing subscription uses the trial caps. An active subscription uses the Pro caps, including a yearly plan. Counters are per user and per UTC month. Deleting a file does not refund that month's file count. Restore does not count as an applied edit. A recalculation counts when LibreOffice starts, whether it finishes or not. A refusal before LibreOffice starts (not a workbook, no formulas, or LibreOffice is missing) does not count. A proposal counts when it is saved. An unchanged recalculation does not save a proposal.
 
-Files expire 24 hours after last use. `set_retention` accepts 24 or 168 (7 days). `POST /internal/purge` with header `x-stetwise-purge` deletes expired rows and unreferenced blobs. Schedule that call on the file host. It does not create cloud resources by itself.
+Files expire 24 hours after last use. `set_retention` accepts 24 or 168 (7 days). `POST /internal/purge` with header `x-stetwise-purge` deletes expired rows and unreferenced blobs. `GET /internal/purge` with `Authorization: Bearer $CRON_SECRET` does the same call for Vercel Cron. Objects under `incoming/` and `stage/` younger than 2 hours are left in place. The route does not create cloud resources by itself.
 
 ## Persistence
 
@@ -97,31 +101,33 @@ Hosted state uses the Supabase project you create. This repository does not crea
 
 1. Create a Supabase project and copy the project URL, anon key, and service role key into the host environment. The service role key stays on the server.
 2. Open the SQL editor and run `supabase/schema.sql`. That creates `profiles`, `usage_monthly`, `files`, `file_versions`, `proposals`, `upload_nonces`, `audit_events`, and `support_requests`, plus the private Storage bucket `stetwise-files`.
-3. Confirm the bucket is private. Blobs are stored at `{user_id}/{sha256}`. Only the service role on the server reads or writes them. Clients get a 15-minute download link.
+3. Confirm the bucket is private. Content blobs are stored at `{user_id}/{sha256}`. Client uploads land at `{user_id}/incoming/{nonce}` and engine output lands at `{user_id}/stage/{uuid}` until the server copies them onto the content key. The service role stays on the MCP server. Clients and the engine use 15-minute signed URLs.
 4. Set `STETWISE_STORE` unset (or anything other than `local`) on the host so the server uses this adapter. Keep `STETWISE_STORE=local` for laptops and tests.
-5. Schedule `POST /internal/purge` at least once an hour against the file host, with header `x-stetwise-purge: $STETWISE_PURGE_SECRET`. Expired files, expired proposals, and blobs nothing references are removed. Default retention is 24 hours after last use. `set_retention` can set 168 hours.
+5. Schedule purge at least once an hour. Vercel Cron calls `GET /internal/purge` with `Authorization: Bearer $CRON_SECRET`. `POST /internal/purge` with header `x-stetwise-purge: $STETWISE_PURGE_SECRET` remains. Expired files, expired proposals, and blobs nothing references are removed. In-progress `incoming/` and `stage/` objects younger than 2 hours are kept. Default retention is 24 hours after last use. `set_retention` can set 168 hours.
 
 `profiles.id` references `auth.users`. Dev auth (`STETWISE_DEV_AUTH`) is for the local store only.
 
 ## Hosting
 
-Recommended shape: one Node container serves MCP, account pages, uploads, and downloads. A private engine container does the OOXML work. Supabase holds accounts and blobs. Vercel is not on the file path.
+Vercel serves the MCP and account pages. The engine is a separate container: Vercel at 2 vCPU and 4 GB, with Fly.io as the fallback. Supabase holds accounts and the private bucket. File bytes do not pass through Vercel. A request body there is capped at 4.5 MB, and base64 of a 25 MB file is far larger than that.
 
 ```text
-assistant  --JSON-->  Node container  /mcp
-client     --PUT/GET--> Node container  /v1/upload  /v1/download
-Node       --HMAC-->  engine container  (ENGINE_URL)
-Node       --service role-->  Supabase Postgres + private bucket stetwise-files
+assistant --JSON--> Vercel (MCP, auth, account pages, maxDuration 300)
+client    --PUT/GET--> Supabase Storage signed URLs (15 minutes)
+Vercel    --HMAC timestamp + nonce--> engine container
+engine    --signed URL--> Supabase Storage (fetch and write)
+Vercel    --service role--> Postgres, sign, and copy
 ```
 
-Run the Node image with `STETWISE_HTTP_ONLY=1`, `ENGINE_URL`, `ENGINE_HMAC_SECRET`, the Supabase keys, and `STETWISE_SIGNING_SECRET`. Leave `STETWISE_ACCEPT_UPLOADS` unset. `APP_BASE_URL` is that container's public origin. A 25 MB body fits because the cap is enforced in the upload stream (`26214400` bytes), not by a serverless body limit.
+Hosted `start_upload` returns a signed PUT URL for `{owner}/incoming/{nonce}`. The client uploads straight to Storage, then calls `complete_upload`. The engine reads that object, and the server copies it to `{owner}/{sha256}`. `export` returns a signed GET URL. Propose, apply, recalc, and import pass signed URLs and object keys. The engine fetches and writes Storage itself. The MCP server does not put file bytes in the engine JSON.
 
-Optional split: Vercel serves MCP JSON and the account pages, and the Node container serves files.
+The engine signs `timestamp.nonce.body` with `ENGINE_HMAC_SECRET`. Requests older than 5 minutes, and reused nonces, are rejected. The nonce cache is in memory on each engine process. `STETWISE_ENGINE_MAX_BODY` defaults to 4 MiB. CPU work runs in a process pool (`STETWISE_ENGINE_CONCURRENCY`, default 2). `/health` does not wait on that pool. The engine reads `PORT` and defaults to 8080.
 
-- Vercel: `APP_BASE_URL` is the Vercel origin, `STETWISE_FILE_BASE_URL` is the Node origin, `STETWISE_ACCEPT_UPLOADS=0`. Both sides share the Supabase keys and `STETWISE_SIGNING_SECRET`.
-- Node container: `STETWISE_HTTP_ONLY=1`, `ENGINE_URL`, `STETWISE_ACCEPT_UPLOADS` unset. `start_upload` and `export` already put `STETWISE_FILE_BASE_URL` in the link, so the file bytes never go to Vercel.
+`vercel.json` uses the functions and rewrites form. `src/server.ts` has `maxDuration` 300. An hourly cron hits `GET /internal/purge`. Set `STETWISE_ACCEPT_UPLOADS=0` on Vercel so a stray `/v1/upload` is refused.
 
-Use the container-only shape when edits themselves must run outside Vercel. A tool call loads the workbook on whichever process serves `/mcp` and sends it to the engine. The upload route is what the 25 MB cap needs. The container-only shape keeps that load off Vercel as well.
+Local and dev leave `ENGINE_URL` unset. `start_upload` and `export` then use `/v1/upload` and `/v1/download` on this Node process, and the engine sees base64. That path is what tests use.
+
+The engine is not a public client. It accepts only those signed requests. It does open outbound connections: to the Storage URLs in the request, and to an attachment URL the MCP server has already checked. Vercel and Fly.io cannot enforce a no-outbound policy, so that is not a guarantee. File contents are not logged. Do not give the engine the service role key.
 
 Do not deploy from this repository. Do not create Stripe products or prices. Checkout only references `STRIPE_PRODUCT_ID`, `STRIPE_PRICE_MONTHLY`, and `STRIPE_PRICE_YEARLY`.
 
@@ -134,7 +140,7 @@ Do not deploy from this repository. Do not create Stripe products or prices. Che
 - `recalculate` runs LibreOffice on a copy and previews cached formula values. Dates, currency, and percents stay numbers. Booleans, errors, and strings keep their own cell types. Apply that proposal to keep them. Undo restores the previous bytes. The current head is cached between propose and apply, and dropped when the file expires or is deleted.
 - Word edits are direct when tracking is off. Pass `track_changes: true`, or edit a document that already has tracking on, and the same change is written as `w:ins` / `w:del` by Stetwise.
 - Versions, undo, and a signed download link.
-- ChatGPT file import (`import_file`) and a signed upload link for other clients.
+- ChatGPT file import (`import_file`) and a signed upload link for other clients. Hosted clients call `complete_upload` after the PUT.
 - OAuth metadata, consent, Stripe Checkout with a 14-day trial that does not require a card (`payment_method_collection=if_required`, missing payment method cancels at the end of the trial), and the billing portal. Same account shape as Continuity.
 - Byte-level refusal when a workbook or document cannot be edited safely. Untouched zip entries are copied with their original compressed bytes.
 
@@ -162,7 +168,7 @@ Do not deploy from this repository. Do not create Stripe products or prices. Che
 - `supabase/schema.sql` is applied by you in the Supabase SQL editor. This repository does not create the project.
 - No Excel-saved golden file for row insert. The shifter follows Excel's reference rules and is tested on the hand-built model.
 - Formula edits clear the cached value and set `fullCalcOnLoad` unless you call `recalculate`, which patches LibreOffice values from a copy. Chart caches and pivot caches are not refreshed.
-- The engine port must not be public. Require `ENGINE_HMAC_SECRET` and a network policy.
+- The engine accepts HMAC-signed requests from the MCP server (timestamp, nonce, 5-minute window). It fetches and writes the Storage objects those requests name. Vercel and Fly.io cannot enforce a no-outbound policy. Require `ENGINE_HMAC_SECRET`. File contents are not logged.
 - DNS rebinding between the address check and the connection is still possible. Hosts that resolve to private addresses are refused at check time.
 - `openpyxl` is not used. Whole-workbook saves drop shapes and pivots, so edits stay at the package and XML part.
 - `npm run benchmark` writes `BENCHMARKS.md` with CPU time and peak memory for inspect, propose, apply, restore, and recalculate. Those numbers are from the machine that ran the script. `python3 scripts/benchmark.py --recalc-only` refreshes only the recalculate section.

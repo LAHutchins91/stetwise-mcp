@@ -25,13 +25,14 @@ export function installPublicPages(app: Express) {
         "Privacy policy",
         `<p>Effective October 11, 2026. Stetwise by Ouroboros is operated for Ouroboros. Contact <a href="mailto:ouroborosplugins@gmail.com">ouroborosplugins@gmail.com</a> or use the <a href="/support">support form</a>.</p>
 <h2>What we process</h2>
-<p>We process account email, subscription status, and the Office files you upload so an assistant you connect can preview and apply edits. We store immutable versions so you can undo. On a hosted install, file bytes live in a private Supabase Storage bucket. The service role on the server is the only key that reads them.</p>
+<p>We process account email, subscription status, and the Office files you upload so an assistant you connect can preview and apply edits. We store immutable versions so you can undo. On a hosted install, file bytes live in a private Supabase Storage bucket. You upload and download those bytes with a short-lived signed link. The MCP server keeps the service role key. The engine does not. It receives a signed link for the object it is asked to read or write.</p>
 <h2>Retention</h2>
 <p>Files are deleted 24 hours after they were last used. You can set retention to 7 days (168 hours) instead. You can delete a file, or every file, sooner. Download links last 15 minutes. Upload links are one-time and last 15 minutes. Proposals expire after 30 minutes.</p>
 <h2>Logs and training</h2>
 <p>Logs contain operation names, hashes, and sizes. They do not contain file contents, cell values, or document text. File contents are not used to train models. We do not sell files.</p>
 <h2>Subprocessors</h2>
-<p>Supabase provides sign-in and, when configured, the database. Vercel may host the MCP and account pages. The engine host runs the file editor. Stripe processes payment. Google provides optional sign-in. We do not store complete card numbers.</p>
+<p>Supabase provides email sign-in and, when configured, the database and private file storage. Vercel may host the MCP and account pages. The engine runs as a container on Vercel (2 vCPU and 4 GB) or on Fly.io. Stripe processes payment. Sign-in is email, plus the OAuth consent an assistant opens. We do not offer Google sign-in. We do not store complete card numbers.</p>
+<p>The engine accepts HMAC-signed requests from the MCP server. Each request carries a timestamp and a nonce, and is rejected when it is older than 5 minutes or when that nonce was already used. The engine then fetches and writes the private Storage objects named in the request, and it can download an attachment URL the MCP server has already checked. File contents are not logged. Vercel and Fly.io cannot enforce a ban on outbound connections, so that is not a guarantee. Unsigned clients cannot call the engine.</p>
 <h2>Caps</h2>
 <p>Monthly caps limit applied edits, new files, proposals, and recalculations. Each started 5 MB counts as one unit. Stetwise does not bill overage. A refused call is the whole response.</p>`
       )

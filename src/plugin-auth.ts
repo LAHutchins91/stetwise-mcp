@@ -25,8 +25,8 @@ export function installPluginAuth(app: Express, baseUrl: string, supabaseUrl: st
 <style>body{margin:0;background:#0b1020;color:#edf1ff;font:17px/1.6 system-ui}main{max-width:560px;margin:8vh auto;padding:28px}a{color:#b4c5ff}button{font:inherit;padding:12px 20px;border-radius:10px;border:1px solid #637bb0;background:#2945a6;color:white;cursor:pointer;margin:8px 8px 8px 0}.secondary{background:transparent}.card{border:1px solid #39445f;border-radius:16px;padding:24px;margin:20px 0}#error{color:#ffb8b8}label{display:block;margin:12px 0}input{box-sizing:border-box;width:100%;padding:10px;font:inherit;border:1px solid #637bb0;border-radius:8px;background:#151d30;color:inherit}[hidden]{display:none!important}</style>
 </head><body><main><a href="/">Stetwise by Ouroboros</a><h1 id="heading">Connect Stetwise</h1>
 <p id="status" role="status">Checking your sign-in…</p><p id="error" role="alert"></p>
-<button id="signout" class="secondary" hidden>Use a different account</button><button id="signin" hidden>Continue with Google</button>
-<details id="passwordLogin" hidden><summary>Sign in with email and password</summary><form id="passwordForm"><label>Email<input id="loginEmail" type="email" required autocomplete="username"></label><label>Password<input id="loginPassword" type="password" required autocomplete="current-password"></label><button>Sign in</button></form></details>
+<button id="signout" class="secondary" hidden>Use a different account</button>
+<form id="passwordForm" hidden><label>Email<input id="loginEmail" type="email" required autocomplete="username"></label><label>Password<input id="loginPassword" type="password" required autocomplete="current-password"></label><button>Sign in</button></form>
 <section id="consent" class="card" hidden><h2 id="client"></h2><ul><li>Upload, read, and edit the Excel and Word files you send.</li><li>Save versions so an edit can be undone.</li><li>Read your email and whether your trial or Pro subscription is active.</li></ul>
 <p>Monthly caps still apply. This connection cannot buy a plan or add an overage charge.</p>
 <small id="destination"></small><small id="scopes"></small>
@@ -44,8 +44,7 @@ try{
  var client=window.supabase.createClient(cfg.supabaseUrl,cfg.anonKey);
  var result=await client.auth.getSession();if(result.error)throw result.error;
  el('passwordForm').onsubmit=async function(e){e.preventDefault();var button=this.querySelector('button');button.disabled=true;try{var r=await client.auth.signInWithPassword({email:el('loginEmail').value,password:el('loginPassword').value});el('loginPassword').value='';if(r.error)throw Error('Email/password sign-in failed.');location.reload()}catch(err){fail(err);button.disabled=false}};
- el('signin').onclick=async function(){el('signin').disabled=true;try{var r=await client.auth.signInWithOAuth({provider:'google',options:{redirectTo:location.origin+'/'}});if(r.error)throw r.error}catch(err){fail(err);el('signin').disabled=false}};
- if(!result.data.session){el('status').textContent='Sign in to choose which application can edit files in your account.';el('signin').hidden=false;el('passwordLogin').hidden=false;return}
+ if(!result.data.session){el('status').textContent='Sign in with the email and password for this account.';el('passwordForm').hidden=false;return}
  el('status').textContent='Signed in as '+result.data.session.user.email;
  el('signout').hidden=false;el('signout').onclick=async function(){this.disabled=true;try{var r=await client.auth.signOut({scope:'local'});if(r.error)throw r.error;location.reload()}catch(err){fail(err);this.disabled=false}};
  if(location.pathname==='/connections'){

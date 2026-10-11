@@ -24,17 +24,28 @@ export async function engineCall<T>(payload: Record<string, unknown>): Promise<T
   return body.result;
 }
 
+export function engineAuthHeaders(secret: string, body: Buffer, now = Date.now()): Record<string, string> {
+  const timestamp = String(Math.floor(now / 1000));
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const signature = crypto.createHmac("sha256", secret).update(`${timestamp}.${nonce}.`).update(body).digest("hex");
+  return {
+    "content-type": "application/json",
+    "x-stetwise-timestamp": timestamp,
+    "x-stetwise-nonce": nonce,
+    "x-stetwise-signature": signature
+  };
+}
+
 async function callHttp(payload: Record<string, unknown>): Promise<unknown> {
   const secret = process.env.ENGINE_HMAC_SECRET || "";
   if (!secret) throw new ToolError("ENGINE_HMAC_SECRET is not set.", "engine_unconfigured");
   const body = Buffer.from(JSON.stringify(payload));
-  const signature = crypto.createHmac("sha256", secret).update(body).digest("hex");
   const url = `${process.env.ENGINE_URL!.replace(/\/$/, "")}/v1/dispatch`;
   let response: Response;
   try {
     response = await fetch(url, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-stetwise-signature": signature },
+      headers: engineAuthHeaders(secret, body),
       body,
       signal: AbortSignal.timeout(TIMEOUT_MS)
     });

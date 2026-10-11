@@ -10,6 +10,7 @@ import { billingPatch, checkoutForm, stripeEvent } from "./billing.js";
 import {
   acceptUploads,
   appBaseUrl,
+  cronSecret,
   DEV_USER_ID,
   devAuthEnabled,
   devToken,
@@ -195,7 +196,7 @@ document.querySelectorAll('.checkout').forEach(function(btn){btn.onclick=async f
   try{
     var client=window.supabase.createClient(cfg.url,cfg.key);
     var session=await client.auth.getSession();
-    if(!session.data.session){await client.auth.signInWithOAuth({provider:'google',options:{redirectTo:location.origin+'/'}});return}
+    if(!session.data.session){message.textContent='Sign in with email at /oauth/consent, then return here to start the trial.';btn.disabled=false;return}
     var response=await fetch('/billing/checkout',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+session.data.session.access_token},body:JSON.stringify({plan:btn.getAttribute('data-plan')})});
     var data=await response.json();
     if(!response.ok) throw Error(data.error||'Checkout could not start.');
@@ -331,6 +332,12 @@ app.put("/v1/upload/:token", async (req, res) => {
     if (!profile || !entitled(profile)) throw new ToolError("An active trial or Pro subscription is required.", "access");
     const tier = tierFor(profile);
     const bytes = await readLimited(req, planCaps(tier).maxFileBytes, tier);
+    if (process.env.ENGINE_URL) {
+      throw new ToolError(
+        "ENGINE_URL is set, so this process does not forward file bytes. PUT to the signed Storage URL and call complete_upload.",
+        "use_signed_url"
+      );
+    }
     const inspected = await engineCall<{ kind: string }>({
       action: "inspect",
       filename: parsed.filename,
@@ -367,6 +374,18 @@ app.get("/v1/download/:token", async (req, res) => {
   } catch (error) {
     httpError(error, res);
   }
+});
+
+app.get("/internal/purge", async (req, res) => {
+  const secret = cronSecret();
+  const header = req.header("authorization") || "";
+  const given = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
+  if (!secret || given.length !== secret.length || !timingSafe(given, secret)) {
+    return res.status(401).json({ error: { code: "unauthorized", reason: "Purge is not authorized." } });
+  }
+  const result = await getStore().purge();
+  logEvent({ op: "purge", code: "ok" });
+  res.json(result);
 });
 
 app.post("/internal/purge", async (req, res) => {

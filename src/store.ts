@@ -156,6 +156,7 @@ export interface Store {
     diff: unknown;
     warnings: unknown;
     verification: unknown;
+    stored?: boolean;
   }): Promise<ProposalRow>;
   getProposal(ownerId: string, proposalId: string): Promise<ProposalRow>;
   publishEdit(ownerId: string, proposalId: string, baseVersion: string, now?: Date): Promise<PublishResult>;
@@ -537,8 +538,12 @@ export class LocalStore implements Store {
     diff: unknown;
     warnings: unknown;
     verification: unknown;
+    stored?: boolean;
   }): Promise<ProposalRow> {
     return locked(() => {
+      if (input.stored) {
+        throw new ToolError("Stored proposals require the Supabase store.", "bad_config");
+      }
       const state = load();
       const file = liveFile(state, input.ownerId, input.fileId);
       if (file.headSha !== input.baseSha) {

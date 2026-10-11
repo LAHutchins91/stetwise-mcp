@@ -115,7 +115,12 @@ describe("supabase store", () => {
           res.writeHead(200).end(JSON.stringify([{ name: USER, id: null }]));
           return;
         }
-        res.writeHead(200).end(JSON.stringify([{ name: `${"b".repeat(64)}`, id: "obj" }]));
+        const fresh = new Date().toISOString();
+        res.writeHead(200).end(JSON.stringify([
+          { name: "b".repeat(64), id: "obj" },
+          { name: `incoming/${"c".repeat(32)}`, id: "in", created_at: fresh },
+          { name: "stage/00000000-0000-4000-8000-0000000000cc", id: "st", created_at: "2020-01-01T00:00:00.000Z" }
+        ]));
         return;
       }
       if (req.method === "DELETE" && url === "/storage/v1/object/stetwise-files") {
@@ -146,12 +151,62 @@ describe("supabase store", () => {
 
     const purged = await store.purge();
     expect(purged.files).toBe(1);
-    expect(purged.blobs).toBe(2);
+    expect(purged.blobs).toBe(3);
     const deleted = heard.filter((call) => call.method === "DELETE");
     const paths = JSON.parse(deleted[0].body.toString("utf8")) as string[];
     expect(paths).toContain(`${USER}/${"a".repeat(64)}`);
     expect(paths).toContain(`${USER}/${"b".repeat(64)}`);
+    expect(paths).toContain(`${USER}/stage/00000000-0000-4000-8000-0000000000cc`);
+    expect(paths.some((item) => item.includes("/incoming/"))).toBe(false);
     delete process.env.STETWISE_CAP_TRIAL_FILES;
+  });
+
+  it("signs upload and download URLs and copies an object without reading bytes", async () => {
+    const { server: httpServer, heard } = listen((req, res, body) => {
+      const url = req.url || "";
+      if (req.method === "POST" && url.startsWith("/storage/v1/object/sign/")) {
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+          signedURL: `/object/sign/stetwise-files/${USER}/${"d".repeat(64)}?token=download-token`
+        }));
+        return;
+      }
+      if (req.method === "POST" && url.startsWith("/storage/v1/object/upload/sign/")) {
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+          url: `/object/upload/sign/stetwise-files/${USER}/incoming/${"e".repeat(32)}`,
+          token: "upload-token"
+        }));
+        return;
+      }
+      if (req.method === "POST" && url === "/storage/v1/object/copy") {
+        res.writeHead(200, { "content-type": "application/json" }).end(body.length ? "{}" : "{}");
+        return;
+      }
+      res.writeHead(404).end("{}");
+    });
+    server = httpServer;
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    process.env.SUPABASE_URL = `http://127.0.0.1:${port}`;
+    process.env.SUPABASE_SERVICE_ROLE_KEY = "service-role-test";
+    const store = new SupabaseStore();
+    const content = `${USER}/${"d".repeat(64)}`;
+    const incoming = `${USER}/incoming/${"e".repeat(32)}`;
+    const stage = `${USER}/stage/00000000-0000-4000-8000-0000000000dd`;
+    const download = await store.signedDownload(content);
+    expect(download.url).toBe(`http://127.0.0.1:${port}/storage/v1/object/sign/stetwise-files/${content}?token=download-token`);
+    const upload = await store.signedUpload(incoming);
+    expect(upload.url).toContain(`/storage/v1/object/upload/sign/stetwise-files/${incoming}`);
+    expect(upload.url).toContain("token=upload-token");
+    await store.copyObject(stage, content);
+    const copy = heard.find((call) => call.url === "/storage/v1/object/copy");
+    expect(JSON.parse(copy!.body.toString("utf8"))).toEqual({
+      bucketId: "stetwise-files",
+      sourceKey: stage,
+      destinationKey: content
+    });
+    expect(heard.some((call) => call.method === "GET" && call.url.includes("/storage/v1/object/stetwise-files/"))).toBe(false);
   });
 
   it("declares the private bucket, retention window, and service-role functions", () => {

@@ -13,4 +13,5 @@ COPY stetwise ./stetwise
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8080
 USER nobody
-CMD ["uvicorn", "stetwise.api:app", "--host", "0.0.0.0", "--port", "8080"]
+# PORT defaults to 8080 inside stetwise.api. Vercel and Fly set PORT.
+CMD ["python", "-m", "stetwise.api"]

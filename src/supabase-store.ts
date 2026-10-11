@@ -176,6 +176,28 @@ function blobPath(ownerId: string, hash: string): string {
   return `${ownerId}/${hash}`;
 }
 
+const OBJECT_KEY = /^[0-9a-f-]{36}\/(?:[a-f0-9]{64}|incoming\/[a-f0-9]{32}|stage\/[0-9a-f-]{36})$/i;
+const STAGING_GRACE_MS = 2 * 60 * 60 * 1000;
+
+function encodeObjectKey(key: string): string {
+  if (!OBJECT_KEY.test(key)) throw new ToolError("Bad storage key.", "bad_hash");
+  return key.split("/").map(encodeURIComponent).join("/");
+}
+
+function absoluteStorageUrl(signedPath: string): string {
+  if (signedPath.startsWith("http://") || signedPath.startsWith("https://")) return signedPath;
+  const pathName = signedPath.startsWith("/") ? signedPath : `/${signedPath}`;
+  return `${baseUrl()}/storage/v1${pathName}`;
+}
+
+function keepStaging(pathName: string, createdAt: string | undefined, now: Date): boolean {
+  if (!pathName.includes("/incoming/") && !pathName.includes("/stage/")) return false;
+  if (!createdAt) return true;
+  const parsed = Date.parse(createdAt);
+  if (Number.isNaN(parsed)) return true;
+  return now.getTime() - parsed < STAGING_GRACE_MS;
+}
+
 export class SupabaseStore implements Store {
   private async uploadBlob(ownerId: string, hash: string, bytes: Buffer): Promise<void> {
     const headers = authHeaders(false);
@@ -223,19 +245,21 @@ export class SupabaseStore implements Store {
     return unique.length;
   }
 
-  private async listBlobs(): Promise<string[]> {
-    const paths: string[] = [];
+  private async listBlobs(): Promise<{ path: string; createdAt?: string }[]> {
+    const paths: { path: string; createdAt?: string }[] = [];
     const folders = await this.listPrefix("");
     for (const folder of folders) {
       if (folder.id) {
-        paths.push(folder.name);
+        paths.push({ path: folder.name, createdAt: folder.created_at || folder.updated_at });
         continue;
       }
       let offset = 0;
       for (;;) {
         const page = await this.listPrefix(`${folder.name}/`, offset);
         if (page.length === 0) break;
-        for (const item of page) paths.push(`${folder.name}/${item.name}`);
+        for (const item of page) {
+          paths.push({ path: `${folder.name}/${item.name}`, createdAt: item.created_at || item.updated_at });
+        }
         if (page.length < 1000) break;
         offset += page.length;
       }
@@ -243,8 +267,65 @@ export class SupabaseStore implements Store {
     return paths;
   }
 
-  private async listPrefix(prefix: string, offset = 0): Promise<{ name: string; id: string | null }[]> {
+  private async listPrefix(prefix: string, offset = 0): Promise<{ name: string; id: string | null; created_at?: string; updated_at?: string }[]> {
     return rest("POST", `/storage/v1/object/list/${BUCKET}`, { prefix, limit: 1000, offset, sortBy: { column: "name", order: "asc" } });
+  }
+
+  async signedDownload(key: string, expiresIn = 900): Promise<{ url: string; key: string }> {
+    const row = await rest<{ signedURL?: string; signedUrl?: string }>(
+      "POST",
+      `/storage/v1/object/sign/${BUCKET}/${encodeObjectKey(key)}`,
+      { expiresIn }
+    );
+    const signed = row?.signedURL || row?.signedUrl || "";
+    if (!signed) throw new ToolError("Storage did not return a download link.", "store");
+    return { url: absoluteStorageUrl(signed), key };
+  }
+
+  async signedUpload(key: string): Promise<{ url: string; key: string }> {
+    const row = await rest<{ url?: string; token?: string }>(
+      "POST",
+      `/storage/v1/object/upload/sign/${BUCKET}/${encodeObjectKey(key)}`,
+      {}
+    );
+    let url = row?.url || "";
+    const token = row?.token || "";
+    if (!url && token) url = `/object/upload/sign/${BUCKET}/${key}`;
+    if (!url) throw new ToolError("Storage did not return an upload link.", "store");
+    url = absoluteStorageUrl(url);
+    if (token && !url.includes("token=")) url += `${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
+    return { url, key };
+  }
+
+  async copyObject(sourceKey: string, destinationKey: string): Promise<void> {
+    encodeObjectKey(sourceKey);
+    encodeObjectKey(destinationKey);
+    const headers = authHeaders(true);
+    headers.set("x-upsert", "true");
+    const response = await fetch(`${baseUrl()}/storage/v1/object/copy`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ bucketId: BUCKET, sourceKey, destinationKey }),
+      signal: AbortSignal.timeout(120_000)
+    });
+    if (response.ok) return;
+    const text = await response.text();
+    if ((response.status === 400 || response.status === 409) && /already exists|duplicate/i.test(text)) return;
+    throwMapped(text);
+  }
+
+  async deleteObject(key: string): Promise<void> {
+    encodeObjectKey(key);
+    await this.deleteBlobs([key]);
+  }
+
+  async getReservedUpload(ownerId: string, fileId: string): Promise<{ nonce: string; filename: string; exp: string }> {
+    const rows = await rest<Row[]>(
+      "GET",
+      `/rest/v1/upload_nonces?owner_id=eq.${encodeURIComponent(ownerId)}&file_id=eq.${encodeURIComponent(fileId)}&select=nonce,filename,exp&limit=1`
+    );
+    if (!rows[0]) throw new ToolError("This upload link was already used or has expired.", "expired_link");
+    return { nonce: String(rows[0].nonce), filename: String(rows[0].filename), exp: String(rows[0].exp) };
   }
 
   async ensureProfile(input: { id: string; email?: string | null; plan?: string; subscription_status?: string }): Promise<Profile> {
@@ -368,13 +449,39 @@ export class SupabaseStore implements Store {
     if (input.bytes.length > caps.maxFileBytes) throw new FileTooLargeError(input.bytes.length, caps.maxFileBytes, tier);
     const hash = sha256(input.bytes);
     await this.uploadBlob(input.ownerId, hash, input.bytes);
+    return this.commitStored({
+      ownerId: input.ownerId,
+      filename: input.filename,
+      kind: input.kind,
+      sha: hash,
+      size: input.bytes.length,
+      nonce: input.nonce,
+      now
+    });
+  }
+
+  async commitStored(input: {
+    ownerId: string;
+    filename: string;
+    kind: string;
+    sha: string;
+    size: number;
+    nonce?: string;
+    now?: Date;
+  }): Promise<FileSummary> {
+    const now = input.now ?? new Date();
+    const profile = await this.requireEntitled(input.ownerId);
+    const tier = tierFor(profile);
+    const caps = planCaps(tier);
+    if (!/^[a-f0-9]{64}$/.test(input.sha)) throw new ToolError("Bad content hash.", "bad_hash");
+    if (input.size > caps.maxFileBytes) throw new FileTooLargeError(input.size, caps.maxFileBytes, tier);
     const row = await rpc<Row>("stetwise_commit_file", {
       p_owner: input.ownerId,
       p_file_id: crypto.randomUUID(),
       p_filename: input.filename,
       p_kind: input.kind,
-      p_sha: hash,
-      p_size: input.bytes.length,
+      p_sha: input.sha,
+      p_size: input.size,
       p_nonce: input.nonce ?? "",
       p_month: monthKey(now),
       p_files_cap: caps.files,
@@ -477,8 +584,13 @@ export class SupabaseStore implements Store {
     diff: unknown;
     warnings: unknown;
     verification: unknown;
+    stored?: boolean;
   }): Promise<ProposalRow> {
-    if (sha256(input.bytes) !== input.resultSha) throw new ToolError("Bad content hash.", "bad_hash");
+    if (input.stored) {
+      if (!/^[a-f0-9]{64}$/.test(input.resultSha)) throw new ToolError("Bad content hash.", "bad_hash");
+    } else if (sha256(input.bytes) !== input.resultSha) {
+      throw new ToolError("Bad content hash.", "bad_hash");
+    }
     const profile = await this.requireEntitled(input.ownerId);
     const tier = tierFor(profile);
     const file = await this.liveFile(input.ownerId, input.fileId);
@@ -488,7 +600,7 @@ export class SupabaseStore implements Store {
     if (view.proposals.used + units > view.proposals.cap) {
       throw new QuotaError("proposals", view.proposals.used, view.proposals.cap, tier, now, units);
     }
-    await this.uploadBlob(input.ownerId, input.resultSha, input.bytes);
+    if (!input.stored) await this.uploadBlob(input.ownerId, input.resultSha, input.bytes);
     const row = await rpc<Row>("stetwise_save_proposal", {
       p_id: crypto.randomUUID(),
       p_owner: input.ownerId,
@@ -505,7 +617,7 @@ export class SupabaseStore implements Store {
       p_tier: tier
     });
     const proposal = proposalFrom(row);
-    headCachePut(headKey(input.ownerId, file.id, input.resultSha), input.bytes, file.expiresAt);
+    if (!input.stored) headCachePut(headKey(input.ownerId, file.id, input.resultSha), input.bytes, file.expiresAt);
     return proposal;
   }
 
@@ -598,7 +710,10 @@ export class SupabaseStore implements Store {
     const paths = drop.map((item) => `${item.owner_id}/${item.sha256}`);
     try {
       const listed = await this.listBlobs();
-      for (const path of listed) if (!keep.has(path)) paths.push(path);
+      for (const item of listed) {
+        if (keep.has(item.path) || keepStaging(item.path, item.createdAt, now)) continue;
+        paths.push(item.path);
+      }
     } catch {
       // The explicit drop list still removes blobs the database released.
     }

@@ -1,9 +1,9 @@
 # Glama builds this image and checks that the MCP server starts.
-# This image is also the long-running Node process for MCP, uploads, and downloads.
-# It does not include Python. Set ENGINE_URL to the private engine container.
+# Hosted file bytes go to Supabase Storage with signed URLs, not through this process.
+# Set ENGINE_URL to the engine container. It fetches and writes those objects.
 # Set STETWISE_HTTP_ONLY=1 so a closed stdin does not also start stdio.
-# Vercel cannot accept a 25 MB body. Point STETWISE_FILE_BASE_URL at this process
-# and set STETWISE_ACCEPT_UPLOADS=0 on Vercel.
+# Local and dev still accept PUT and GET on /v1/upload and /v1/download.
+# Set STETWISE_ACCEPT_UPLOADS=0 on the Vercel MCP process.
 FROM node:22-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./

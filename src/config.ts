@@ -108,3 +108,8 @@ export function purgeSecret(): string {
   if (process.env.NODE_ENV === "production") return "";
   return signingSecret();
 }
+
+/** Vercel Cron sends Authorization: Bearer CRON_SECRET on GET /internal/purge. */
+export function cronSecret(): string {
+  return process.env.CRON_SECRET || "";
+}

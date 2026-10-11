@@ -85,7 +85,7 @@ describe("MCP", () => {
     const listed = await rpc("tools/list", {}, 2);
     expect(listed.status).toBe(200);
     const names = (listed.json.result.tools as { name: string }[]).map((tool) => tool.name);
-    for (const name of ["inspect", "read", "search", "propose_edit", "apply_edit", "list_versions", "restore_version", "export", "start_upload", "import_file", "create_file", "list_comments", "get_usage", "set_retention", "recalculate"]) {
+    for (const name of ["inspect", "read", "search", "propose_edit", "apply_edit", "list_versions", "restore_version", "export", "start_upload", "complete_upload", "import_file", "create_file", "list_comments", "get_usage", "set_retention", "recalculate"]) {
       expect(names).toContain(name);
     }
     const importer = (listed.json.result.tools as { name: string; _meta?: Record<string, unknown> }[]).find((tool) => tool.name === "import_file");

@@ -15,7 +15,7 @@ ChatGPT can pass an attachment to `import_file`. If that reference has no downlo
 curl -T ./file.xlsx "PASTE_THE_UPLOAD_URL"
 ```
 
-Use the `file_id` from that response. Do not paste the workbook into the chat when the upload link works.
+On a hosted account the PUT goes to a Supabase signed URL, and the PUT response is not the file record. Call `complete_upload` with the `file_id` from `start_upload`. On a local install the PUT response is already the file record. Use that `file_id`. Do not paste the workbook into the chat when the upload link works.
 
 ## Edit
 

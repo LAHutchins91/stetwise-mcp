@@ -27,7 +27,7 @@ export function connectPageBody(baseUrl: string) {
 <pre><code>claude mcp add --transport http stetwise ${mcp}</code></pre>
 </section>
 <section><h2>Cursor and Grok</h2>
-<p>Add the MCP address as a remote HTTP server and approve OAuth. Upload with the same curl command, edit through <code>propose_edit</code> then <code>apply_edit</code>, and download with the link from <code>export</code>. Use those links as returned. The file host can be a different origin from the MCP address.</p>
+<p>Add the MCP address as a remote HTTP server and approve OAuth. Upload with the same curl command, edit through <code>propose_edit</code> then <code>apply_edit</code>, and download with the link from <code>export</code>. Use those links as returned. A hosted link is a short-lived Supabase Storage URL: after the PUT, call <code>complete_upload</code>. A local or dev link is on this server, and the PUT response is the file record.</p>
 </section>
 <p>The planned public name stetwise.app is not served by this repository. Use the MCP address of the host you actually run.</p>`;
 }
