@@ -735,6 +735,8 @@ end;
 $$;
 
 -- Pin every Stetwise function, including one created before search_path was set. Idempotent.
+-- stetwise_access_token_hook is excluded: it keeps an empty search_path and is not
+-- granted to service_role. Apply supabase/oauth_resource_binding.sql after this file.
 do $$
 declare
   fn regprocedure;
@@ -743,7 +745,9 @@ begin
     select p.oid::regprocedure
     from pg_proc p
     join pg_namespace n on n.oid = p.pronamespace
-    where n.nspname = 'public' and p.proname like 'stetwise_%'
+    where n.nspname = 'public'
+      and p.proname like 'stetwise_%'
+      and p.proname <> 'stetwise_access_token_hook'
   loop
     execute format('alter function %s set search_path = public, pg_temp', fn);
   end loop;
@@ -757,7 +761,9 @@ begin
     select p.oid::regprocedure
     from pg_proc p
     join pg_namespace n on n.oid = p.pronamespace
-    where n.nspname = 'public' and p.proname like 'stetwise_%'
+    where n.nspname = 'public'
+      and p.proname like 'stetwise_%'
+      and p.proname <> 'stetwise_access_token_hook'
   loop
     execute format('revoke all on function %s from public', fn);
     execute format('revoke all on function %s from anon, authenticated', fn);

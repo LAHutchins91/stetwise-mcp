@@ -5,6 +5,8 @@
 --   update stetwise_private.settings set value = 'https://YOUR_HOST/mcp' where key = 'mcp_resource';
 --   Dashboard: Authentication → Hooks → Custom Access Token → public.stetwise_access_token_hook
 -- Re-applying is safe. The setting is not overwritten.
+-- Apply this file after supabase/schema.sql. schema.sql skips this hook; this file
+-- is still last so its revoke of service_role is the final grant state.
 --
 -- Supabase does not attach a session to the authorization it came from. Bind only when
 -- at least one approved, unexpired authorization for this client_id and user exists and
@@ -88,6 +90,7 @@ end
 $norm$;
 
 revoke all on function stetwise_private.normalize_mcp_resource(text) from public, anon, authenticated;
+revoke execute on function stetwise_private.normalize_mcp_resource(text) from service_role;
 grant execute on function stetwise_private.normalize_mcp_resource(text) to supabase_auth_admin;
 alter function stetwise_private.normalize_mcp_resource(text) set search_path = '';
 
@@ -152,15 +155,14 @@ begin
          and a.expires_at > now();
 
       if open_count > 0 and bad_count = 0 then
-        begin
-          insert into stetwise_private.oauth_resources (session_id, resource, strict_match)
-          values (sid, expected, true)
-          on conflict (session_id) do update
-            set resource = excluded.resource,
-                strict_match = true;
-        exception when others then
-          null;
-        end;
+        -- Persist the row before binding. A failed insert returns the original event
+        -- below, so this token stays unbound instead of binding once and failing refresh
+        -- after the approvals expire.
+        insert into stetwise_private.oauth_resources (session_id, resource, strict_match)
+        values (sid, expected, true)
+        on conflict (session_id) do update
+          set resource = excluded.resource,
+              strict_match = true;
         trusted := expected;
       end if;
     end if;
@@ -177,5 +179,6 @@ end
 $fn$;
 
 revoke all on function public.stetwise_access_token_hook(jsonb) from public, anon, authenticated;
+revoke execute on function public.stetwise_access_token_hook(jsonb) from service_role;
 grant execute on function public.stetwise_access_token_hook(jsonb) to supabase_auth_admin;
 alter function public.stetwise_access_token_hook(jsonb) set search_path = '';

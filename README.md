@@ -103,8 +103,8 @@ Dev and tests use the local directory (`STETWISE_STORE=local`, or no Supabase ke
 Hosted state uses the Supabase project you create. This repository does not create the project, the bucket, or any Stripe object.
 
 1. Create a Supabase project and copy the project URL, anon key, and service role key into the host environment. The service role key stays on the server.
-2. Open the SQL editor and run `supabase/schema.sql`. That creates `profiles`, `usage_monthly`, `files`, `file_versions`, `proposals`, `upload_nonces`, `audit_events`, and `support_requests`, plus the private Storage bucket `stetwise-files`. Running it again is safe: it updates the bucket in place. The bucket `file_size_limit` is 25 MiB (26214400 bytes). `support_requests` has row level security and no policies, so anon and authenticated roles have no access; the service role writes it. Stetwise functions pin `search_path` to `public, pg_temp`.
-3. Run `supabase/oauth_resource_binding.sql` in the SQL editor. Running it again is safe and does not overwrite the resource setting. Then set that setting to the exact MCP URL, `APP_BASE_URL` plus `/mcp`, with https, no trailing slash, and no query or fragment:
+2. Open the SQL editor and run `supabase/schema.sql`. That creates `profiles`, `usage_monthly`, `files`, `file_versions`, `proposals`, `upload_nonces`, `audit_events`, and `support_requests`, plus the private Storage bucket `stetwise-files`. Running it again is safe: it updates the bucket in place. The bucket `file_size_limit` is 25 MiB (26214400 bytes). `support_requests` has row level security and no policies, so anon and authenticated roles have no access; the service role writes it. Stetwise functions pin `search_path` to `public, pg_temp`. Those loops skip `stetwise_access_token_hook`.
+3. Run `supabase/oauth_resource_binding.sql` last, after `schema.sql`. If you re-apply `schema.sql`, run the hook file again afterward. Running it again is safe and does not overwrite the resource setting. Then set that setting to the exact MCP URL, `APP_BASE_URL` plus `/mcp`, with https, no trailing slash, and no query or fragment:
 
 ```sql
 update stetwise_private.settings
@@ -126,7 +126,7 @@ Supabase does not attach a code to its authorization, and an approval stays open
 Vercel serves the MCP and account pages. The engine is a separate container: Vercel at 2 vCPU and 4 GB, with Fly.io as the fallback. Supabase holds accounts and the private bucket. File bytes do not pass through Vercel. A request body there is capped at 4.5 MB, and base64 of a 25 MB file is far larger than that.
 
 ```text
-assistant --JSON--> Vercel (MCP, auth, account pages, maxDuration 300)
+assistant --JSON--> Vercel (MCP, auth, account pages)
 client    --PUT/GET--> Supabase Storage signed URLs (15 minutes)
 Vercel    --HMAC timestamp + nonce--> engine container
 engine    --signed URL--> Supabase Storage (fetch and write)
@@ -137,7 +137,7 @@ Hosted `start_upload` returns a signed PUT URL for `{owner}/incoming/{nonce}`. T
 
 The engine signs `timestamp.nonce.body` with `ENGINE_HMAC_SECRET`. Requests older than 5 minutes, and reused nonces, are rejected. The nonce cache is in memory on each engine process. `STETWISE_ENGINE_MAX_BODY` defaults to 4 MiB. CPU work runs in a process pool (`STETWISE_ENGINE_CONCURRENCY`, default 2). `/health` does not wait on that pool. The engine reads `PORT` and defaults to 8080.
 
-`vercel.json` uses the functions and rewrites form. `src/server.ts` has `maxDuration` 300. An hourly cron hits `GET /internal/purge`. Set `STETWISE_ACCEPT_UPLOADS=0` on Vercel so a stray `/v1/upload` is refused.
+`vercel.json` sets `"framework": "express"` and an hourly cron for `GET /internal/purge`. It has no rewrites and no functions entry. Set `STETWISE_ACCEPT_UPLOADS=0` on Vercel so a stray `/v1/upload` is refused.
 
 Local and dev leave `ENGINE_URL` unset. `start_upload` and `export` then use `/v1/upload` and `/v1/download` on this Node process, and the engine sees base64. That path is what tests use.
 

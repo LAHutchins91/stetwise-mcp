@@ -33,18 +33,20 @@ describe("hosting", () => {
     delete process.env.CRON_SECRET;
   });
 
-  it("uses functions and rewrites with a 300 second limit", () => {
+  it("deploys as an Express app with the purge cron and no rewrites", () => {
     const config = JSON.parse(fs.readFileSync(path.join(repoRoot(), "vercel.json"), "utf8")) as {
-      functions: Record<string, { maxDuration: number }>;
-      rewrites: { source: string; destination: string }[];
+      framework?: string;
+      functions?: unknown;
+      rewrites?: unknown;
       crons: { path: string; schedule: string }[];
       builds?: unknown;
       routes?: unknown;
     };
+    expect(config.framework).toBe("express");
+    expect(config.functions).toBeUndefined();
+    expect(config.rewrites).toBeUndefined();
     expect(config.builds).toBeUndefined();
     expect(config.routes).toBeUndefined();
-    expect(config.functions["src/server.ts"].maxDuration).toBe(300);
-    expect(config.rewrites[0]).toEqual({ source: "/(.*)", destination: "/src/server.ts" });
     expect(config.crons[0]).toEqual({ path: "/internal/purge", schedule: "0 * * * *" });
   });
 

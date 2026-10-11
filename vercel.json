@@ -1,9 +1,4 @@
 {
-  "functions": {
-    "src/server.ts": {
-      "maxDuration": 300
-    }
-  },
-  "rewrites": [{ "source": "/(.*)", "destination": "/src/server.ts" }],
+  "framework": "express",
   "crons": [{ "path": "/internal/purge", "schedule": "0 * * * *" }]
 }

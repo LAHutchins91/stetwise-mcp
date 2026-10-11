@@ -43,6 +43,9 @@ begin
   if not exists (select 1 from pg_roles where rolname = 'supabase_auth_admin') then
     create role supabase_auth_admin nologin;
   end if;
+  if not exists (select 1 from pg_roles where rolname = 'service_role') then
+    create role service_role nologin;
+  end if;
 end
 $$;
 `;
@@ -244,12 +247,31 @@ describe("OAuth resource audience", () => {
     expect(await audience(later, clientA)).toEqual(["authenticated", expected]);
   });
 
+  it("leaves the token unbound when the session row cannot be saved", async () => {
+    const sessionId = "55555555-5555-4555-8555-555555555577";
+    await db.query(`delete from auth.oauth_authorizations where client_id = ${slot(1)}`, [clientA]);
+    await approve(clientA, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbba", expected, "0 minutes");
+    await db.exec("revoke insert, update on table stetwise_private.oauth_resources from supabase_auth_admin");
+    try {
+      await expect(audience(sessionId, clientA)).resolves.toBe("authenticated");
+      const stored = await db.query<{ n: number }>(
+        `select count(*)::int as n from stetwise_private.oauth_resources where session_id = ${slot(1)}`,
+        [sessionId]
+      );
+      expect(stored.rows[0]?.n).toBe(0);
+    } finally {
+      await db.exec("grant insert, update on table stetwise_private.oauth_resources to supabase_auth_admin");
+    }
+  });
+
   it("keeps execute limited to supabase_auth_admin and an empty search_path", async () => {
     const privileges = await db.query<{
       anon_exec: boolean;
       auth_exec: boolean;
       public_exec: boolean;
       admin_exec: boolean;
+      service_exec: boolean;
+      helper_service_exec: boolean;
       admin_select: boolean;
       config: string[] | null;
     }>(`
@@ -257,6 +279,8 @@ describe("OAuth resource audience", () => {
              has_function_privilege('authenticated', 'public.stetwise_access_token_hook(jsonb)', 'execute') as auth_exec,
              has_function_privilege('public', 'public.stetwise_access_token_hook(jsonb)', 'execute') as public_exec,
              has_function_privilege('supabase_auth_admin', 'public.stetwise_access_token_hook(jsonb)', 'execute') as admin_exec,
+             has_function_privilege('service_role', 'public.stetwise_access_token_hook(jsonb)', 'execute') as service_exec,
+             has_function_privilege('service_role', 'stetwise_private.normalize_mcp_resource(text)', 'execute') as helper_service_exec,
              has_table_privilege('supabase_auth_admin', 'auth.oauth_authorizations', 'select') as admin_select,
              p.proconfig as config
         from pg_proc p
@@ -268,6 +292,8 @@ describe("OAuth resource audience", () => {
     expect(row?.auth_exec).toBe(false);
     expect(row?.public_exec).toBe(false);
     expect(row?.admin_exec).toBe(true);
+    expect(row?.service_exec).toBe(false);
+    expect(row?.helper_service_exec).toBe(false);
     expect(row?.admin_select).toBe(true);
     expect(row?.config?.some((item) => item.startsWith("search_path="))).toBe(true);
     expect(row?.config?.join(" ")).not.toContain("public");
@@ -276,6 +302,35 @@ describe("OAuth resource audience", () => {
     await db.exec(hookSql);
     const kept = await db.query<{ value: string }>("select value from stetwise_private.settings where key = 'mcp_resource'");
     expect(kept.rows[0]?.value).toBe(expected);
+  });
+
+  it("leaves the hook alone when schema.sql pins the other Stetwise functions", async () => {
+    const schema = fs.readFileSync(path.join(repoRoot(), "supabase/schema.sql"), "utf8");
+    const pin = schema.slice(schema.indexOf("-- Pin every Stetwise function"));
+    expect(pin).toContain("stetwise_access_token_hook");
+    await db.exec(`
+      create or replace function public.stetwise_marker()
+      returns integer
+      language sql
+      set search_path = ''
+      as 'select 1';
+      revoke all on function public.stetwise_marker() from public, service_role;
+    `);
+    await db.exec(pin);
+    const rows = await db.query<{ name: string; service_exec: boolean; config: string[] | null }>(`
+      select p.proname as name,
+             has_function_privilege('service_role', p.oid, 'execute') as service_exec,
+             p.proconfig as config
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = 'public' and p.proname in ('stetwise_access_token_hook', 'stetwise_marker')
+    `);
+    const hook = rows.rows.find((item) => item.name === "stetwise_access_token_hook");
+    const marker = rows.rows.find((item) => item.name === "stetwise_marker");
+    expect(hook?.service_exec).toBe(false);
+    expect(hook?.config?.join(" ")).not.toContain("public");
+    expect(marker?.service_exec).toBe(true);
+    expect(marker?.config?.join(" ")).toContain("public");
   });
 });
 
