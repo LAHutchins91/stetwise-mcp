@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { appBaseUrl } from "./config.js";
+import { fileBaseUrl } from "./config.js";
 import { engineCall } from "./engine-client.js";
 import { ToolError } from "./errors.js";
 import { logEvent } from "./log.js";
@@ -148,7 +148,7 @@ export function createStetwiseServer(ownerId: string) {
         exp: reserved.exp,
         nonce: reserved.nonce
       });
-      const upload_url = `${appBaseUrl()}/v1/upload/${token}`;
+      const upload_url = `${fileBaseUrl()}/v1/upload/${token}`;
       return {
         file_id: reserved.fileId,
         upload_url,
@@ -368,7 +368,7 @@ export function createStetwiseServer(ownerId: string) {
         sha256: chosen.sha256,
         size: chosen.size,
         expires_at: new Date(exp * 1000).toISOString(),
-        download_url: `${appBaseUrl()}/v1/download/${token}`
+        download_url: `${fileBaseUrl()}/v1/download/${token}`
       };
     }
   );

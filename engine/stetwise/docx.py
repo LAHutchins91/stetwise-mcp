@@ -223,6 +223,39 @@ def _ensure_text_index(xml: bytes, root: etree._Element) -> None:
         )
 
 
+def _compose_piece_texts(pieces: list[dict], spans: list[tuple[int, int]], replace: str) -> list[str]:
+    """Rebuild each run from the original offsets.
+
+    A longer or shorter replacement must not move the coordinates of the next
+    match. Spans are original visible-text offsets and do not overlap.
+    """
+    outputs: list[str] = []
+    for piece in pieces:
+        original = piece["text"]
+        start = piece["start"]
+        end = start + len(original)
+        if not original or not spans:
+            outputs.append(original)
+            continue
+        chunks: list[str] = []
+        pos = start
+        for begin, stop in spans:
+            if stop <= start or begin >= end:
+                continue
+            keep_to = min(max(begin, start), end)
+            if keep_to > pos:
+                chunks.append(original[pos - start : keep_to - start])
+            if start <= begin < end:
+                chunks.append(replace)
+            pos = min(stop, end)
+            if pos >= end:
+                break
+        if pos < end:
+            chunks.append(original[pos - start :])
+        outputs.append("".join(chunks))
+    return outputs
+
+
 def replace_text(package: Package, find: str, replace: str, occurrence: int | None = None) -> EditResult:
     if not find:
         raise StetwiseRefusal("The text to find is empty.", "empty_query")
@@ -267,8 +300,7 @@ def replace_text(package: Package, find: str, replace: str, occurrence: int | No
             seen += 1
         if not chosen:
             continue
-        # Rebuild piece text from the original, applying chosen spans left to right.
-        piece_text = [piece["text"] for piece in pieces]
+        safe: list[tuple[int, int]] = []
         for begin, end in chosen:
             touched = [
                 index
@@ -280,21 +312,9 @@ def replace_text(package: Package, find: str, replace: str, occurrence: int | No
             if any(pieces[index]["revision"] for index in touched):
                 skipped.append({"anchor": f"p-{number}", "reason": "match overlaps existing tracked changes"})
                 continue
-            first = touched[0]
-            last = touched[-1]
-            prefix_cut = begin - pieces[first]["start"]
-            suffix_cut = end - pieces[last]["start"]
-            prefix = piece_text[first][:prefix_cut]
-            suffix = piece_text[last][suffix_cut:]
-            if first == last:
-                piece_text[first] = prefix + replace + suffix
-            else:
-                piece_text[first] = prefix + replace
-                for index in touched[1:-1]:
-                    piece_text[index] = ""
-                piece_text[last] = suffix
+            safe.append((begin, end))
             applied.append({"anchor": f"p-{number}", "before": visible[begin:end], "after": replace})
-        for piece, text in zip(pieces, piece_text):
+        for piece, text in zip(pieces, _compose_piece_texts(pieces, safe, replace), strict=True):
             if text != piece["text"]:
                 updates[indexes[piece["node"]]] = text
     if not applied:

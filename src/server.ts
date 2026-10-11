@@ -8,6 +8,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { billingPatch, checkoutForm, stripeEvent } from "./billing.js";
 import {
+  acceptUploads,
   appBaseUrl,
   DEV_USER_ID,
   devAuthEnabled,
@@ -19,6 +20,7 @@ import {
   stripeProductId,
   stripeSecret,
   supabaseAnonKey,
+  useSupabaseStore,
   supabaseServiceKey,
   supabaseUrl
 } from "./config.js";
@@ -216,7 +218,10 @@ app.get("/health", (_req, res) => {
     stripeMonthlyConfigured: Boolean(stripePriceMonthly()),
     stripeYearlyConfigured: Boolean(stripePriceYearly()),
     billingConfigured: Boolean(stripeSecret() && stripeProductId() && stripePriceMonthly() && stripePriceYearly()),
-    engineUrlConfigured: Boolean(process.env.ENGINE_URL)
+    engineUrlConfigured: Boolean(process.env.ENGINE_URL),
+    store: useSupabaseStore() ? "supabase" : "local",
+    acceptUploads: acceptUploads(),
+    fileHostConfigured: Boolean(process.env.STETWISE_FILE_BASE_URL)
   });
 });
 
@@ -303,7 +308,21 @@ function httpError(error: unknown, res: Response) {
   res.status(status).json({ error: { code, reason } });
 }
 
+function rejectFileBody(res: Response): void {
+  res.status(421).json({
+    error: {
+      code: "use_file_host",
+      reason: "This host does not accept file bodies. Use the upload or download link exactly as the tool returned it."
+    }
+  });
+}
+
 app.put("/v1/upload/:token", async (req, res) => {
+  if (!acceptUploads()) {
+    rejectFileBody(res);
+    req.destroy();
+    return;
+  }
   try {
     const parsed = readToken(String(req.params.token));
     if (parsed.typ !== "put") throw new ToolError("This link is not an upload link.", "bad_link");
@@ -332,6 +351,7 @@ app.put("/v1/upload/:token", async (req, res) => {
 });
 
 app.get("/v1/download/:token", async (req, res) => {
+  if (!acceptUploads()) return rejectFileBody(res);
   try {
     const parsed = readToken(String(req.params.token));
     if (parsed.typ !== "get") throw new ToolError("This link is not a download link.", "bad_link");

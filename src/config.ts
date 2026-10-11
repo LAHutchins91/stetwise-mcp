@@ -61,7 +61,18 @@ export function supabaseServiceKey(): string {
 
 export function useSupabaseStore(): boolean {
   if (process.env.STETWISE_STORE === "local") return false;
+  if (process.env.NODE_ENV === "test" && process.env.STETWISE_STORE !== "supabase") return false;
   return Boolean(supabaseUrl() && supabaseServiceKey());
+}
+
+/** Public origin that accepts file PUT and GET. Defaults to the MCP origin. */
+export function fileBaseUrl(): string {
+  return (process.env.STETWISE_FILE_BASE_URL || appBaseUrl()).replace(/\/$/, "");
+}
+
+/** Vercel sets this to 0. The Node container leaves it unset and accepts bodies up to the plan cap. */
+export function acceptUploads(): boolean {
+  return process.env.STETWISE_ACCEPT_UPLOADS !== "0";
 }
 
 export function stripeSecret(): string {

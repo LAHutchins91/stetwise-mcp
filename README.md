@@ -22,7 +22,7 @@ docker build -f engine/Dockerfile -t stetwise-engine engine
 docker run --rm -p 8080:8080 -e ENGINE_HMAC_SECRET=change-me stetwise-engine
 ```
 
-The root `Dockerfile` is the Node MCP image (the Glama check). It does not contain the Python engine. For a long-running HTTP process set `STETWISE_HTTP_ONLY=1` so a closed stdin does not also start the stdio transport.
+The root `Dockerfile` is the Node image. It does not contain the Python engine. For a long-running HTTP process set `STETWISE_HTTP_ONLY=1` so a closed stdin does not also start the stdio transport. Set `ENGINE_URL` on that image. See Hosting below for the 25 MB file path.
 
 ```bash
 curl -T ./model.xlsx "$UPLOAD_URL"
@@ -46,7 +46,7 @@ See `.env.example`. Names only:
 
 | Variable | Role |
 |---|---|
-| `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | OAuth sign-in. Tools still persist in the local store until a hosted database is attached. |
+| `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | OAuth sign-in. When the URL and service role key are set, and `STETWISE_STORE` is not `local`, accounts, versions, usage, and file blobs use Supabase. |
 | `STRIPE_SECRET_KEY` | Stripe secret key. |
 | `STRIPE_WEBHOOK_SECRET` | Signing secret for `POST /billing/webhook`. |
 | `STRIPE_PRODUCT_ID` | Existing product `prod_VQ12q90uKDcoto` (Stetwise by Ouroboros). |
@@ -54,12 +54,15 @@ See `.env.example`. Names only:
 | `STRIPE_PRICE_YEARLY` | Existing yearly price `price_1UPB0953QnCs3zydvFaCDgDw`. Used when the yearly plan is selected. |
 | `APP_BASE_URL` | Public origin. MCP resource is `{APP_BASE_URL}/mcp`. |
 | `ENGINE_URL`, `ENGINE_HMAC_SECRET` | Engine container. Unset `ENGINE_URL` uses the local Python module. |
-| `STETWISE_DATA_DIR` | Local database directory. Default `.data`. |
+| `STETWISE_STORE` | `local` keeps `STETWISE_DATA_DIR`. Unset, with Supabase keys, uses Postgres and Storage. |
 | `STETWISE_SIGNING_SECRET` | HMAC for upload and download links. |
 | `STETWISE_PURGE_SECRET` | `POST /internal/purge` header `x-stetwise-purge`. |
 | `STETWISE_DEV_AUTH`, `STETWISE_DEV_TOKEN` | Local bearer. Refused in production. |
 | `STETWISE_PYTHON` | Python executable. Default `python3`. |
+| `STETWISE_DATA_DIR` | Local database directory when the store is local. Default `.data`. Dev and tests use this. |
 | `STETWISE_HTTP_ONLY` | Set to `1` on the HTTP host. |
+| `STETWISE_FILE_BASE_URL` | Public origin of the Node process that accepts file PUT and GET. Defaults to `APP_BASE_URL`. |
+| `STETWISE_ACCEPT_UPLOADS` | Set to `0` on Vercel so that process refuses file bodies. Leave unset on the Node container. |
 | `OPENAI_APPS_CHALLENGE` | Optional ChatGPT domain check. |
 | `PORT` | HTTP port. Default `3000`. |
 
@@ -80,7 +83,43 @@ Monthly caps, overridable without a code change:
 
 Trial file cap defaults to 25 new files per UTC month. Pro is 250. A trialing subscription uses the trial caps. An active subscription uses the Pro caps, including a yearly plan. Counters are per user and per UTC month. Deleting a file does not refund that month's file count. Restore does not count as an applied edit. A refused recalculation does not count.
 
-Files expire 24 hours after last use. `set_retention` accepts 24 or 168 (7 days). `POST /internal/purge` deletes expired bytes.
+Files expire 24 hours after last use. `set_retention` accepts 24 or 168 (7 days). `POST /internal/purge` with header `x-stetwise-purge` deletes expired rows and unreferenced blobs. Schedule that call on the file host. It does not create cloud resources by itself.
+
+## Persistence
+
+Dev and tests use the local directory (`STETWISE_STORE=local`, or no Supabase keys). A container restart or a serverless instance does not keep that directory.
+
+Hosted state uses the Supabase project you create. This repository does not create the project, the bucket, or any Stripe object.
+
+1. Create a Supabase project and copy the project URL, anon key, and service role key into the host environment. The service role key stays on the server.
+2. Open the SQL editor and run `supabase/schema.sql`. That creates `profiles`, `usage_monthly`, `files`, `file_versions`, `proposals`, `upload_nonces`, `audit_events`, and `support_requests`, plus the private Storage bucket `stetwise-files`.
+3. Confirm the bucket is private. Blobs are stored at `{user_id}/{sha256}`. Only the service role on the server reads or writes them. Clients get a 15-minute download link.
+4. Set `STETWISE_STORE` unset (or anything other than `local`) on the host so the server uses this adapter. Keep `STETWISE_STORE=local` for laptops and tests.
+5. Schedule `POST /internal/purge` at least once an hour against the file host, with header `x-stetwise-purge: $STETWISE_PURGE_SECRET`. Expired files, expired proposals, and blobs nothing references are removed. Default retention is 24 hours after last use. `set_retention` can set 168 hours.
+
+`profiles.id` references `auth.users`. Dev auth (`STETWISE_DEV_AUTH`) is for the local store only.
+
+## Hosting
+
+Recommended shape: one Node container serves MCP, account pages, uploads, and downloads. A private engine container does the OOXML work. Supabase holds accounts and blobs. Vercel is not on the file path.
+
+```text
+assistant  --JSON-->  Node container  /mcp
+client     --PUT/GET--> Node container  /v1/upload  /v1/download
+Node       --HMAC-->  engine container  (ENGINE_URL)
+Node       --service role-->  Supabase Postgres + private bucket stetwise-files
+```
+
+Run the Node image with `STETWISE_HTTP_ONLY=1`, `ENGINE_URL`, `ENGINE_HMAC_SECRET`, the Supabase keys, and `STETWISE_SIGNING_SECRET`. Leave `STETWISE_ACCEPT_UPLOADS` unset. `APP_BASE_URL` is that container's public origin. A 25 MB body fits because the cap is enforced in the upload stream (`26214400` bytes), not by a serverless body limit.
+
+Optional split: Vercel serves MCP JSON and the account pages, and the Node container serves files.
+
+- Vercel: `APP_BASE_URL` is the Vercel origin, `STETWISE_FILE_BASE_URL` is the Node origin, `STETWISE_ACCEPT_UPLOADS=0`. Both sides share the Supabase keys and `STETWISE_SIGNING_SECRET`.
+- Node container: `STETWISE_HTTP_ONLY=1`, `ENGINE_URL`, `STETWISE_ACCEPT_UPLOADS` unset. `start_upload` and `export` already put `STETWISE_FILE_BASE_URL` in the link, so the file bytes never go to Vercel.
+
+Use the container-only shape when edits themselves must run outside Vercel. A tool call loads the workbook on whichever process serves `/mcp` and sends it to the engine. The upload route is what the 25 MB cap needs. The container-only shape keeps that load off Vercel as well.
+
+Do not deploy from this repository. Do not create Stripe products or prices. Checkout only references `STRIPE_PRODUCT_ID`, `STRIPE_PRICE_MONTHLY`, and `STRIPE_PRICE_YEARLY`.
 
 ## What works in v1
 
@@ -106,11 +145,10 @@ Files expire 24 hours after last use. `set_retention` accepts 24 or 168 (7 days)
 
 ## Known gaps
 
-- The running server stores accounts, files, versions, proposals, and monthly usage in `STETWISE_DATA_DIR` (JSON plus content-addressed blobs). `supabase/schema.sql` is the Postgres shape, including `usage_monthly`. It is not applied to a live project here.
+- `supabase/schema.sql` is applied by you in the Supabase SQL editor. This repository does not create the project.
 - No Excel-saved golden file for row insert. The shifter follows Excel's reference rules and is tested on the hand-built model.
 - Formula edits clear the cached value and set `fullCalcOnLoad`. Chart caches and pivot caches are not refreshed.
-- Replacing several matches in one Word paragraph is not reliable when the replacement length changes. One match is the supported case.
-- Vercel request bodies are about 4.5 MB. A 25 MB upload needs the Node process (`Dockerfile`) or a later direct-to-storage upload. The engine image stays out of the Vercel bundle.
 - The engine port must not be public. Require `ENGINE_HMAC_SECRET` and a network policy.
 - DNS rebinding between the address check and the connection is still possible. Hosts that resolve to private addresses are refused at check time.
 - `openpyxl` is not used. Whole-workbook saves drop shapes and pivots, so edits stay at the package and XML part.
+- `npm run benchmark` writes `BENCHMARKS.md` with CPU time and peak memory for inspect, propose, apply, and restore. Those numbers are from the machine that ran the script.

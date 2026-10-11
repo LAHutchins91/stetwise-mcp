@@ -1,7 +1,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { dataDir, DEV_USER_ID } from "./config.js";
+import { dataDir, DEV_USER_ID, useSupabaseStore } from "./config.js";
+import { SupabaseStore } from "./supabase-store.js";
 import { ToolError } from "./errors.js";
 import {
   emptyUsage,
@@ -104,10 +105,64 @@ export type PublishResult = {
   usage: ReturnType<typeof usageView>;
 };
 
+export type VersionSummary = {
+  version: number;
+  sha256: string;
+  size: number;
+  op: VersionRow["op"];
+  created_at: string;
+};
+
+export interface Store {
+  ensureProfile(input: { id: string; email?: string | null; plan?: string; subscription_status?: string }): Promise<Profile>;
+  ensureDevProfile(): Promise<Profile>;
+  getProfile(id: string): Promise<Profile | null>;
+  updateProfile(id: string, patch: Partial<Profile>): Promise<Profile>;
+  usage(ownerId: string, now?: Date): Promise<ReturnType<typeof usageView>>;
+  replaceUsage(ownerId: string, counts: Partial<UsageCounts>, now?: Date): Promise<void>;
+  setRetention(ownerId: string, hours: 24 | 168): Promise<Profile>;
+  reserveUpload(ownerId: string, filename: string, now?: Date): Promise<{ fileId: string; nonce: string; exp: number }>;
+  commitNewFile(input: {
+    ownerId: string;
+    filename: string;
+    kind: string;
+    bytes: Buffer;
+    nonce?: string;
+    now?: Date;
+  }): Promise<FileSummary>;
+  listFiles(ownerId: string, now?: Date): Promise<FileSummary[]>;
+  getFile(ownerId: string, fileId: string): Promise<FileSummary>;
+  readOwnedBlob(ownerId: string, fileId: string, hash: string): Promise<{ bytes: Buffer; file: FileRow }>;
+  readBytes(ownerId: string, fileId: string, hash?: string): Promise<{ bytes: Buffer; file: FileRow }>;
+  listVersions(ownerId: string, fileId: string): Promise<VersionSummary[]>;
+  saveProposal(input: {
+    ownerId: string;
+    fileId: string;
+    baseSha: string;
+    resultSha: string;
+    size: number;
+    bytes: Buffer;
+    diff: unknown;
+    warnings: unknown;
+    verification: unknown;
+  }): Promise<ProposalRow>;
+  getProposal(ownerId: string, proposalId: string): Promise<ProposalRow>;
+  publishEdit(ownerId: string, proposalId: string, baseVersion: string, now?: Date): Promise<PublishResult>;
+  recordRecalculation(ownerId: string, now?: Date): Promise<ReturnType<typeof usageView>>;
+  assertRecalcAllowed(ownerId: string, now?: Date): Promise<void>;
+  restore(ownerId: string, fileId: string, version: number, now?: Date): Promise<PublishResult>;
+  deleteFile(ownerId: string, fileId: string): Promise<void>;
+  deleteAll(ownerId: string): Promise<number>;
+  purge(now?: Date): Promise<{ files: number; blobs: number }>;
+  audit(event: { ownerId: string; op: string; fileId?: string; sha256?: string; size?: number; code: string }): Promise<void>;
+  support(email: string, message: string): Promise<{ id: string }>;
+  expireFile(fileId: string, at: string): Promise<void>;
+}
+
 const EMPTY = (): State => ({ profiles: {}, files: {}, versions: [], proposals: {}, uploads: {}, usage: {} });
 
 let chain: Promise<unknown> = Promise.resolve();
-let cached: LocalStore | undefined;
+let cached: Store | undefined;
 
 function locked<T>(fn: () => T): Promise<T> {
   const run = chain.then(() => fn());
@@ -229,7 +284,7 @@ function referenced(state: State, now: Date): Set<string> {
   return shas;
 }
 
-export class LocalStore {
+export class LocalStore implements Store {
   ensureProfile(input: { id: string; email?: string | null; plan?: string; subscription_status?: string }): Promise<Profile> {
     return locked(() => {
       const state = load();
@@ -697,8 +752,14 @@ function requireEntitled(state: State, ownerId: string): Profile {
   return profile;
 }
 
-export function getStore(): LocalStore {
-  cached ??= new LocalStore();
+export function getStore(): Store {
+  if (!cached) {
+    if (useSupabaseStore()) {
+      cached = new SupabaseStore();
+    } else {
+      cached = new LocalStore();
+    }
+  }
   return cached;
 }
 

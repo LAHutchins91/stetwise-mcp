@@ -210,6 +210,70 @@ def test_docx_split_run_replace_preserves_revisions_comments_and_styles():
     assert result["verification"]["changed_parts"] == ["word/document.xml"]
 
 
+def _body_docx(inner: str) -> bytes:
+    ns_ct = "http://schemas.openxmlformats.org/package/2006/content-types"
+    ns_rel = "http://schemas.openxmlformats.org/package/2006/relationships"
+    ns_off = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    ns_w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    parts = {
+        "[Content_Types].xml": f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="{ns_ct}">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>
+""",
+        "_rels/.rels": f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="{ns_rel}">
+  <Relationship Id="rId1" Type="{ns_off}/officeDocument" Target="word/document.xml"/>
+</Relationships>
+""",
+        "word/document.xml": f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="{ns_w}"><w:body>{inner}</w:body></w:document>
+""",
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, text in parts.items():
+            archive.writestr(name, text.encode("utf-8"))
+    return buffer.getvalue()
+
+
+def _visible_text(blob: bytes) -> str:
+    xml = _part(blob, "word/document.xml")
+    raw = b"".join(re_wt.findall(xml)).decode("utf-8")
+    return raw.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+
+
+import re as re_wt_mod
+
+re_wt = re_wt_mod.compile(rb"<w:t(?:\s[^>]*)?>(.*?)</w:t>", re_wt_mod.DOTALL)
+
+
+def test_replace_text_keeps_later_matches_when_the_replacement_length_changes():
+    longer = _body_docx('<w:p><w:r><w:t>aa aa</w:t></w:r></w:p>')
+    edited = _bytes(_propose(longer, "note.docx", [{"op": "replace_text", "find": "aa", "replace": "bbb"}]))
+    assert _visible_text(edited) == "bbb bbb"
+    shorter = _body_docx('<w:p><w:r><w:t>aa aa</w:t></w:r></w:p>')
+    edited = _bytes(_propose(shorter, "note.docx", [{"op": "replace_text", "find": "aa", "replace": "b"}]))
+    assert _visible_text(edited) == "b b"
+    split = _body_docx(
+        '<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>cat</w:t></w:r>'
+        '<w:r><w:t xml:space="preserve"> cat</w:t></w:r></w:p>'
+    )
+    edited = _bytes(_propose(split, "note.docx", [{"op": "replace_text", "find": "cat", "replace": "kitten"}]))
+    document = _part(edited, "word/document.xml")
+    assert _visible_text(edited) == "kitten kitten"
+    assert b"<w:b" in document
+    spanned = _body_docx('<w:p><w:r><w:t>ab</w:t></w:r><w:r><w:t>cd ab</w:t></w:r></w:p>')
+    edited = _bytes(_propose(spanned, "note.docx", [{"op": "replace_text", "find": "ab", "replace": "XYZ"}]))
+    assert _visible_text(edited) == "XYZcd XYZ"
+    escaped = _body_docx('<w:p><w:r><w:t>red red</w:t></w:r></w:p>')
+    edited = _bytes(_propose(escaped, "note.docx", [{"op": "replace_text", "find": "red", "replace": "a&b"}]))
+    assert _visible_text(edited) == "a&b a&b"
+    assert b"a&amp;b" in _part(edited, "word/document.xml")
+
+
 def test_table_cell_and_paragraph_style():
     original = contract_docx()
     result = _propose(

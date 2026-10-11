@@ -247,4 +247,28 @@ describe("MCP", () => {
     const gone = await call("inspect", { file_id: fileId });
     expect(gone.isError).toBe(true);
   });
+
+  it("points upload and download links at the file host and refuses bodies on the edge", async () => {
+    const original = fs.readFileSync(path.join(repoRoot(), "tests/fixtures/generated/model.xlsx"));
+    const fileId = await upload("host.xlsx", original);
+    process.env.STETWISE_FILE_BASE_URL = "https://files.example.test";
+    try {
+      const exported = await call("export", { file_id: fileId });
+      expect(exported.isError, exported.text).toBe(false);
+      expect(String(exported.data.download_url)).toMatch(/^https:\/\/files\.example\.test\/v1\/download\//);
+      const started = await call("start_upload", { filename: "next.xlsx" });
+      expect(started.isError, started.text).toBe(false);
+      expect(String(started.data.upload_url)).toMatch(/^https:\/\/files\.example\.test\/v1\/upload\//);
+      process.env.STETWISE_ACCEPT_UPLOADS = "0";
+      const uploadToken = new URL(String(started.data.upload_url)).pathname.split("/").pop();
+      const refused = await fetch(`${base}/v1/upload/${uploadToken}`, { method: "PUT", body: new Uint8Array([1, 2, 3]) });
+      expect(refused.status).toBe(421);
+      const downloadToken = new URL(String(exported.data.download_url)).pathname.split("/").pop();
+      const blocked = await fetch(`${base}/v1/download/${downloadToken}`);
+      expect(blocked.status).toBe(421);
+    } finally {
+      delete process.env.STETWISE_FILE_BASE_URL;
+      delete process.env.STETWISE_ACCEPT_UPLOADS;
+    }
+  });
 });

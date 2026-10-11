@@ -14,6 +14,7 @@ export default defineConfig({
       STETWISE_DEV_TOKEN: "dev-stetwise",
       STETWISE_SIGNING_SECRET: "test-signing-secret",
       STETWISE_PURGE_SECRET: "test-purge-secret",
+      STETWISE_STORE: "local",
       STETWISE_DATA_DIR: path.join(os.tmpdir(), "stetwise-vitest"),
       APP_BASE_URL: "http://127.0.0.1:9"
     }

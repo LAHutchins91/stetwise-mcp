@@ -11,6 +11,7 @@
     "start": "node dist/src/server.js",
     "test": "vitest run --maxWorkers=1 --hookTimeout=60000",
     "test:engine": "PYTHONPATH=engine:engine/tests python3 -m pytest -q engine/tests",
+    "benchmark": "PYTHONPATH=engine:engine/tests python3 scripts/benchmark.py",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
