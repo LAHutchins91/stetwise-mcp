@@ -125,8 +125,10 @@ describe("MCP", () => {
     const exported = await call("export", { file_id: fileId });
     expect(exported.isError, exported.text).toBe(false);
     const changed = Buffer.from(await (await fetch(String(exported.data.download_url))).arrayBuffer());
-    expect(changed.includes(Buffer.from(SENTINEL))).toBe(true);
     expect(changed.equals(original)).toBe(false);
+    const readBack = await call("read", { file_id: fileId, sheet: "Inputs", range: "A2" });
+    expect(readBack.isError, readBack.text).toBe(false);
+    expect(JSON.stringify(readBack.data)).toContain(SENTINEL);
 
     const restored = await call("restore_version", { file_id: fileId, version: 1 });
     expect(restored.isError, restored.text).toBe(false);
