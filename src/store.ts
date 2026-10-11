@@ -5,6 +5,16 @@ import { dataDir, DEV_USER_ID, useSupabaseStore } from "./config.js";
 import { SupabaseStore } from "./supabase-store.js";
 import { ToolError } from "./errors.js";
 import {
+  headCacheDropFile,
+  headCacheDropOwner,
+  headCacheGet,
+  headCachePut,
+  headCacheTouch,
+  headKey,
+  noteDiskRead,
+  resetHeadCache
+} from "./head-cache.js";
+import {
   emptyUsage,
   entitled,
   expiryFrom,
@@ -13,6 +23,7 @@ import {
   planCaps,
   QuotaError,
   tierFor,
+  usageUnits,
   usageView,
   type PlanTier,
   type UsageCounts,
@@ -148,8 +159,8 @@ export interface Store {
   }): Promise<ProposalRow>;
   getProposal(ownerId: string, proposalId: string): Promise<ProposalRow>;
   publishEdit(ownerId: string, proposalId: string, baseVersion: string, now?: Date): Promise<PublishResult>;
-  recordRecalculation(ownerId: string, now?: Date): Promise<ReturnType<typeof usageView>>;
-  assertRecalcAllowed(ownerId: string, now?: Date): Promise<void>;
+  recordRecalculation(ownerId: string, now?: Date, sizeBytes?: number): Promise<ReturnType<typeof usageView>>;
+  assertRecalcAllowed(ownerId: string, now?: Date, sizeBytes?: number): Promise<void>;
   restore(ownerId: string, fileId: string, version: number, now?: Date): Promise<PublishResult>;
   deleteFile(ownerId: string, fileId: string): Promise<void>;
   deleteAll(ownerId: string): Promise<number>;
@@ -212,23 +223,39 @@ function writeBlob(hash: string, bytes: Buffer): void {
 
 function readBlob(hash: string): Buffer {
   try {
+    noteDiskRead();
     return fs.readFileSync(blobPath(hash));
   } catch {
     throw new ToolError("The file bytes are no longer available.", "missing_bytes");
   }
 }
 
+function cachedBytes(ownerId: string, fileId: string, sha: string, expiresAt: string, now: number): Buffer {
+  const key = headKey(ownerId, fileId, sha);
+  const hit = headCacheGet(key, now);
+  if (hit) {
+    headCacheTouch(key, expiresAt);
+    return hit;
+  }
+  const bytes = readBlob(sha);
+  headCachePut(key, bytes, expiresAt);
+  return bytes;
+}
+
 function countsOf(state: State, ownerId: string, now: Date): UsageCounts {
   return state.usage[ownerId]?.[monthKey(now)] ?? emptyUsage();
 }
 
-function bump(state: State, ownerId: string, metric: UsageMetric, tier: PlanTier, now: Date): UsageCounts {
+function bump(state: State, ownerId: string, metric: UsageMetric, tier: PlanTier, now: Date, units = 1): UsageCounts {
+  if (!Number.isInteger(units) || units < 1) {
+    throw new ToolError("Usage weight must be a positive whole number.", "bad_request");
+  }
   const month = monthKey(now);
   state.usage[ownerId] ??= {};
   const current = state.usage[ownerId][month] ?? emptyUsage();
   const cap = planCaps(tier)[metric];
-  if (current[metric] >= cap) throw new QuotaError(metric, current[metric], cap, tier, now);
-  current[metric] += 1;
+  if (current[metric] + units > cap) throw new QuotaError(metric, current[metric], cap, tier, now, units);
+  current[metric] += units;
   state.usage[ownerId][month] = current;
   return current;
 }
@@ -237,6 +264,7 @@ function liveFile(state: State, ownerId: string, fileId: string, now = new Date(
   const file = state.files[fileId];
   if (!file || file.ownerId !== ownerId) throw new ToolError("File not found.", "not_found");
   if (Date.parse(file.expiresAt) <= now.getTime()) {
+    headCacheDropFile(file.ownerId, fileId);
     throw new ToolError("This file has passed its retention window and can no longer be read.", "expired_file");
   }
   return file;
@@ -409,7 +437,7 @@ export class LocalStore implements Store {
         filename = upload.filename;
       }
       const hash = sha256(input.bytes);
-      bump(state, input.ownerId, "files", tier, now);
+      bump(state, input.ownerId, "files", tier, now, usageUnits(input.bytes.length));
       if (input.nonce) delete state.uploads[input.nonce];
       writeBlob(hash, input.bytes);
       const createdAt = now.toISOString();
@@ -461,20 +489,22 @@ export class LocalStore implements Store {
         (item) => item.ownerId === ownerId && item.fileId === file.id && item.resultSha === hash && Date.parse(item.expiresAt) > Date.now()
       );
       if (!version && !proposal) throw new ToolError("That version is not part of this file.", "not_found");
-      return { bytes: readBlob(hash), file };
+      const now = Date.now();
+      return { bytes: cachedBytes(ownerId, file.id, hash, file.expiresAt, now), file };
     });
   }
 
   readBytes(ownerId: string, fileId: string, hash?: string): Promise<{ bytes: Buffer; file: FileRow }> {
     return locked(() => {
       const state = load();
-      const file = liveFile(state, ownerId, fileId);
+      const now = new Date();
+      const file = liveFile(state, ownerId, fileId, now);
       const sha = hash ?? file.headSha;
       const known = state.versions.some((version) => version.fileId === file.id && version.sha256 === sha);
       if (!known) throw new ToolError("That version is not part of this file.", "not_found");
-      touch(state, file, new Date());
+      touch(state, file, now);
       save(state);
-      return { bytes: readBlob(sha), file };
+      return { bytes: cachedBytes(ownerId, file.id, sha, file.expiresAt, now.getTime()), file };
     });
   }
 
@@ -514,9 +544,12 @@ export class LocalStore implements Store {
       if (file.headSha !== input.baseSha) {
         throw new ToolError("base_version does not match the current file. Propose the edit again.", "stale_version");
       }
-      writeBlob(input.resultSha, input.bytes);
+      const profile = requireEntitled(state, input.ownerId);
       const now = new Date();
+      bump(state, input.ownerId, "proposals", tierFor(profile), now, usageUnits(file.size));
+      writeBlob(input.resultSha, input.bytes);
       touch(state, file, now);
+      headCachePut(headKey(input.ownerId, file.id, input.resultSha), input.bytes, file.expiresAt);
       const row: ProposalRow = {
         id: crypto.randomUUID(),
         ownerId: input.ownerId,
@@ -571,7 +604,7 @@ export class LocalStore implements Store {
         throw new ToolError("base_version does not match the current file. List versions and propose the edit again.", "stale_version");
       }
       const tier = tierFor(profile);
-      bump(state, ownerId, "edits", tier, now);
+      bump(state, ownerId, "edits", tier, now, usageUnits(proposal.size));
       const number = headVersion(state, file) + 1;
       state.versions.push({
         fileId: file.id,
@@ -598,25 +631,26 @@ export class LocalStore implements Store {
     });
   }
 
-  recordRecalculation(ownerId: string, now = new Date()) {
+  recordRecalculation(ownerId: string, now = new Date(), sizeBytes = 1) {
     return locked(() => {
       const state = load();
       const profile = requireEntitled(state, ownerId);
       const tier = tierFor(profile);
-      bump(state, ownerId, "recalculations", tier, now);
+      bump(state, ownerId, "recalculations", tier, now, usageUnits(sizeBytes));
       save(state);
       return usageView(tier, countsOf(state, ownerId, now), profile.retention_hours, now);
     });
   }
 
-  assertRecalcAllowed(ownerId: string, now = new Date()): Promise<void> {
+  assertRecalcAllowed(ownerId: string, now = new Date(), sizeBytes = 1): Promise<void> {
     return locked(() => {
       const state = load();
       const profile = requireEntitled(state, ownerId);
       const tier = tierFor(profile);
+      const units = usageUnits(sizeBytes);
       const used = countsOf(state, ownerId, now).recalculations;
       const cap = planCaps(tier).recalculations;
-      if (used >= cap) throw new QuotaError("recalculations", used, cap, tier, now);
+      if (used + units > cap) throw new QuotaError("recalculations", used, cap, tier, now, units);
     });
   }
 
@@ -657,6 +691,7 @@ export class LocalStore implements Store {
       const state = load();
       const file = state.files[fileId];
       if (!file || file.ownerId !== ownerId) throw new ToolError("File not found.", "not_found");
+      headCacheDropFile(ownerId, fileId);
       delete state.files[fileId];
       state.versions = state.versions.filter((version) => version.fileId !== fileId);
       for (const [id, proposal] of Object.entries(state.proposals)) {
@@ -674,6 +709,7 @@ export class LocalStore implements Store {
         .filter((file) => file.ownerId === ownerId)
         .map((file) => file.id);
       for (const id of ids) delete state.files[id];
+      headCacheDropOwner(ownerId);
       state.versions = state.versions.filter((version) => !ids.includes(version.fileId));
       for (const [id, proposal] of Object.entries(state.proposals)) {
         if (proposal.ownerId === ownerId) delete state.proposals[id];
@@ -689,6 +725,7 @@ export class LocalStore implements Store {
       const state = load();
       const expired = Object.values(state.files).filter((file) => Date.parse(file.expiresAt) <= now.getTime());
       const ids = new Set(expired.map((file) => file.id));
+      for (const file of expired) headCacheDropFile(file.ownerId, file.id);
       for (const id of ids) delete state.files[id];
       state.versions = state.versions.filter((version) => !ids.has(version.fileId));
       for (const [id, proposal] of Object.entries(state.proposals)) {
@@ -739,6 +776,7 @@ export class LocalStore implements Store {
       const file = state.files[fileId];
       if (!file) throw new ToolError("File not found.", "not_found");
       file.expiresAt = at;
+      headCacheDropFile(file.ownerId, fileId);
       save(state);
     });
   }
@@ -766,5 +804,6 @@ export function getStore(): Store {
 export function resetStoreForTests(): void {
   cached = undefined;
   chain = Promise.resolve();
+  resetHeadCache();
   fs.rmSync(dataDir(), { recursive: true, force: true });
 }

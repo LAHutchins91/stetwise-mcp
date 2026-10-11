@@ -15,6 +15,7 @@ from .refs import (
     col_to_num,
     formula_blockers,
     num_to_col,
+    offset_formula,
     shift_cell_ref,
     shift_formula,
     shift_ref_text,
@@ -517,8 +518,8 @@ def _cell_inner(value: str | int | float | bool | None, formula: str | None) -> 
 def set_cells(package: Package, sheet_name: str, cells: list[dict]) -> EditResult:
     if not cells:
         raise StetwiseRefusal("set_cells needs at least one cell.", "empty_edit")
-    if len(cells) > 500:
-        raise StetwiseRefusal("v1 accepts at most 500 cells in one set_cells edit.", "too_many")
+    if len(cells) > 5000:
+        raise StetwiseRefusal("v1 accepts at most 5000 cells in one set_cells edit.", "too_many")
     sheet = _sheet_by_name(package, sheet_name)
     parts = package.parts()
     if _protected(parts[sheet.path]) or _protected(parts["xl/workbook.xml"]):
@@ -641,6 +642,150 @@ def set_cells(package: Package, sheet_name: str, cells: list[dict]) -> EditResul
     if not result.replacements and not result.drop:
         raise StetwiseRefusal("The edit did not change any cell.", "empty_edit")
     return result
+
+
+def _range_count(ref: str) -> tuple[int, int, int, int, int]:
+    c1, r1, c2, r2 = split_ref(ref)
+    return c1, r1, c2, r2, (c2 - c1 + 1) * (r2 - r1 + 1)
+
+
+def _formula_bookkeeping(result: EditResult, parts: dict[str, bytes]) -> None:
+    workbook = _enable_full_calc(parts["xl/workbook.xml"])
+    if workbook != parts["xl/workbook.xml"]:
+        result.replacements["xl/workbook.xml"] = workbook
+    if "xl/calcChain.xml" in parts:
+        result.drop.add("xl/calcChain.xml")
+        rels = parts["xl/_rels/workbook.xml.rels"]
+        content_types = parts["[Content_Types].xml"]
+        new_rels = _REL.sub(b"", rels)
+        new_types = _CT_CALC.sub(b"", content_types)
+        if new_rels == rels or new_types == content_types:
+            raise StetwiseRefusal(
+                "This workbook's calc chain is not in a form v1 can remove safely, so the formula edit was refused.",
+                "calc_chain",
+            )
+        result.replacements["xl/_rels/workbook.xml.rels"] = new_rels
+        result.replacements["[Content_Types].xml"] = new_types
+    result.warnings.append(
+        "Formula cached values were cleared and fullCalcOnLoad was set. Use recalculate to preview LibreOffice values before Excel opens the file."
+    )
+
+
+def clear_range(package: Package, sheet_name: str, ref: str) -> EditResult:
+    """Clear values and formulas in a range. Style indexes stay. Missing cells are not created."""
+    from .xlsx_ops import release_shared, table_role
+
+    _c1, _r1, _c2, _r2, count = _range_count(ref)
+    if count > 5000:
+        raise StetwiseRefusal("v1 accepts at most 5000 cells in one proposal.", "too_many")
+    sheet = _sheet_by_name(package, sheet_name)
+    parts = package.parts()
+    if _protected(parts[sheet.path]) or _protected(parts["xl/workbook.xml"]):
+        raise StetwiseRefusal(
+            f"Sheet {sheet.name!r} or the workbook is protected. v1 will not bypass protection.",
+            "protected",
+        )
+    xml = parts[sheet.path]
+    pivots = [box for box in _pivot_boxes(package) if box["sheet"] == sheet.name and box["ref"]]
+    tables = [box for box in _table_boxes(package) if box.get("sheet") == sheet.name and box["ref"]]
+    merges = _merge_refs(xml)
+    targets: list[str] = []
+    formula_touched = False
+    for _start, _end, open_tag, inner in _iter_tag_spans(xml, _CELL_OPEN, b"c"):
+        cell_ref = dict(_attrs(open_tag)).get("r")
+        if not cell_ref or not cell_in_range(cell_ref, ref):
+            continue
+        if b"<f" not in inner and b"<v" not in inner and b"<is" not in inner:
+            continue
+        targets.append(cell_ref)
+        if b"<f" in inner:
+            formula_touched = True
+    if not targets:
+        raise StetwiseRefusal("The range has no values or formulas to clear.", "empty_edit")
+    warnings: list[str] = []
+    saw_table_body = False
+    for cell_ref in targets:
+        for box in pivots:
+            if cell_in_range(cell_ref, box["ref"]):
+                raise StetwiseRefusal(
+                    f"Cell {cell_ref} is inside pivot table {box['name']} ({box['ref']}). v1 will not rewrite a pivot layout.",
+                    "pivot_cell",
+                )
+        for box in tables:
+            role = table_role(box, cell_ref)
+            if role == "header":
+                raise StetwiseRefusal(
+                    f"Cell {cell_ref} is in the header of Excel table {box['name']} ({box['ref']}). Header edits would rewrite table XML, so v1 leaves that row alone.",
+                    "table_header",
+                )
+            if role == "totals":
+                raise StetwiseRefusal(
+                    f"Cell {cell_ref} is in the totals row of Excel table {box['name']} ({box['ref']}). Totals edits would rewrite table XML, so v1 leaves that row alone.",
+                    "table_totals",
+                )
+            if role == "body" and not saw_table_body:
+                warnings.append(
+                    f"Excel table {box['name']} body cells can change. table XML, the header, and the totals row were not rewritten."
+                )
+                saw_table_body = True
+        for merge in merges:
+            if cell_in_range(cell_ref, merge):
+                origin = merge.split(":")[0].replace("$", "")
+                if origin != cell_ref:
+                    raise StetwiseRefusal(
+                        f"Cell {cell_ref} is inside merged range {merge} but is not its top-left cell.",
+                        "merged_cell",
+                    )
+    changes = []
+    for cell_ref in targets:
+        xml, notes = release_shared(xml, cell_ref)
+        for note in notes:
+            changes.append({"ref": note["ref"], "before": {"shared": True}, "after": note})
+        xml = _blank_styled_cell(xml, cell_ref)
+        changes.append({"ref": cell_ref, "after": None})
+    result = EditResult(warnings=warnings, diff=[{"op": "clear_range", "sheet": sheet.name, "range": ref, "changes": changes}])
+    if xml != parts[sheet.path]:
+        result.replacements[sheet.path] = xml
+    if formula_touched:
+        _formula_bookkeeping(result, parts)
+    if not result.replacements and not result.drop:
+        raise StetwiseRefusal("The edit did not change any cell.", "empty_edit")
+    return result
+
+
+def fill_range(package: Package, sheet_name: str, ref: str, value=None, formula: str | None = None) -> EditResult:
+    """Write one value, or a formula relative to the top-left cell, across a range."""
+    c1, r1, c2, r2, count = _range_count(ref)
+    if count > 5000:
+        raise StetwiseRefusal("v1 accepts at most 5000 cells in one proposal.", "too_many")
+    has_value = value is not None
+    has_formula = formula is not None
+    if has_value == has_formula:
+        raise StetwiseRefusal("fill_range needs a value or a formula, not both.", "ambiguous_cell")
+    cells = []
+    for row in range(r1, r2 + 1):
+        for col in range(c1, c2 + 1):
+            cell_ref = f"{num_to_col(col)}{row}"
+            if has_formula:
+                text = formula[1:] if str(formula).startswith("=") else str(formula)
+                cells.append({"ref": cell_ref, "formula": offset_formula(text, col - c1, row - r1)})
+            else:
+                cells.append({"ref": cell_ref, "value": value})
+    result = set_cells(package, sheet_name, cells)
+    if result.diff:
+        result.diff[0]["op"] = "fill_range"
+        result.diff[0]["range"] = ref
+    return result
+
+
+def _blank_styled_cell(xml: bytes, ref: str) -> bytes:
+    for start, end, open_tag, _inner in _iter_tag_spans(xml, _CELL_OPEN, b"c"):
+        attrs = _attrs(open_tag)
+        if dict(attrs).get("r") != ref:
+            continue
+        kept = [(key, value) for key, value in attrs if key in {"r", "s"}]
+        return xml[:start] + _render_cell(kept, b"") + xml[end:]
+    return xml
 
 
 def _write_cell(xml: bytes, ref: str, inner: bytes, t_value: str | None) -> bytes:

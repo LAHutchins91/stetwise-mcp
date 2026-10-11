@@ -9,9 +9,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from . import xlsx
@@ -65,25 +67,88 @@ def _same(old_raw: str | None, old_type: str | None, kind: str, raw: str) -> boo
     return False
 
 
-def _patch_cache(xml: bytes, ref: str, kind: str, raw: str) -> bytes:
-    cells = xlsx._iter_tag_spans(xml, xlsx._CELL_OPEN, b"c")
-    for start, end, open_tag, inner in cells:
-        attrs = xlsx._attrs(open_tag)
-        if dict(attrs).get("r") != ref:
+def _patch_many(xml: bytes, updates: dict[str, tuple[str, str]]) -> bytes:
+    """Splice every stale cache in one walk. Formula bytes inside each cell stay put."""
+    if not updates:
+        return xml
+    pieces: list[bytes] = []
+    cursor = 0
+    seen: set[str] = set()
+    for start, end, open_tag, inner in xlsx._iter_tag_spans(xml, xlsx._CELL_OPEN, b"c"):
+        ref = dict(xlsx._attrs(open_tag)).get("r")
+        found = updates.get(ref or "")
+        if found is None:
             continue
         if b"<f" not in inner:
             raise StetwiseRefusal(
                 f"Cell {ref} is not a formula cell in the original sheet, so its cached value was left alone.",
                 "recalc_failed",
+                started=True,
             )
+        kind, raw = found
         t_value = {"e": "e", "str": "str", "b": "b"}.get(kind)
-        attrs = xlsx._set_attr(attrs, "t", t_value)
+        attrs = xlsx._set_attr(xlsx._attrs(open_tag), "t", t_value)
         inner = _drop_value(inner)
-        escaped = xml_escape(raw)
-        updated = open_tag if False else xlsx._render_cell(attrs, inner + f"<v>{escaped}</v>".encode("utf-8"))
-        # _render_cell rebuilds the open tag. The formula bytes inside `inner` stay as they were.
-        return xml[:start] + updated + xml[end:]
-    raise StetwiseRefusal(f"Cell {ref} was not found while writing a cached value.", "recalc_failed")
+        updated = xlsx._render_cell(attrs, inner + f"<v>{xml_escape(raw)}</v>".encode("utf-8"))
+        pieces.append(xml[cursor:start])
+        pieces.append(updated)
+        cursor = end
+        seen.add(ref or "")
+    missing = next((ref for ref in updates if ref not in seen), None)
+    if missing is not None:
+        raise StetwiseRefusal(
+            f"Cell {missing} was not found while writing a cached value.",
+            "recalc_failed",
+            started=True,
+        )
+    pieces.append(xml[cursor:])
+    return b"".join(pieces)
+
+
+def _reap(pid_path: Path) -> None:
+    """Stop the soffice process group. The worker is SIGKILLed on timeout, so its finally does not run."""
+    if not pid_path.exists():
+        return
+    lines = pid_path.read_text(encoding="utf-8").splitlines()
+    pid = 0
+    token = lines[1].strip() if len(lines) > 1 else ""
+    try:
+        pid = int(lines[0].strip()) if lines else 0
+    except ValueError:
+        pid = 0
+    if pid > 1:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                break
+            time.sleep(0.15)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+    if token:
+        _kill_cmdline(token)
+
+
+def _kill_cmdline(token: str) -> None:
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return
+    needle = token.encode("utf-8")
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if needle not in command:
+            continue
+        try:
+            os.kill(int(entry.name), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def _drop_value(inner: bytes) -> bytes:
@@ -107,25 +172,39 @@ def recalculate(blob: bytes, filename: str, package: Package) -> dict:
         )
     python = _uno_python()
     worker = Path(__file__).with_name("recalc_uno.py")
+    timeout = float(os.environ.get("STETWISE_RECALC_TIMEOUT") or "60")
     with tempfile.TemporaryDirectory(prefix="stetwise-recalc-") as tmp:
         folder = Path(tmp)
         source = folder / "in.xlsx"
         report_path = folder / "out.json"
+        pid_path = folder / "soffice.pid"
         source.write_bytes(blob)
-        completed = subprocess.run(
-            [python, str(worker), str(source), str(report_path)],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-            env={**os.environ, "HOME": str(folder)},
-        )
+        env = {**os.environ, "HOME": str(folder), "STETWISE_RECALC_PIDFILE": str(pid_path)}
+        try:
+            completed = subprocess.run(
+                [python, str(worker), str(source), str(report_path)],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            _reap(pid_path)
+            raise StetwiseRefusal(
+                "LibreOffice did not finish recalculating within the time limit. The LibreOffice process was stopped.",
+                "recalc_failed",
+                started=True,
+            )
+        started = pid_path.exists()
+        _reap(pid_path)
         if completed.returncode != 0 or not report_path.exists():
             detail = (completed.stderr or completed.stdout or "LibreOffice failed").strip().splitlines()
             tail = detail[-1][:240] if detail else "LibreOffice failed"
             raise StetwiseRefusal(
                 f"LibreOffice could not recalculate this workbook. {tail}",
                 "recalc_failed",
+                started=started,
             )
         report = json.loads(report_path.read_text(encoding="utf-8"))
     calculated = report.get("sheets") or {}
@@ -135,6 +214,7 @@ def recalculate(blob: bytes, filename: str, package: Package) -> dict:
         raise StetwiseRefusal(
             f"LibreOffice did not return sheet {missing[0]!r}, so no cached values were written.",
             "recalc_failed",
+            started=True,
         )
     strings = xlsx._shared_strings(package)
     formats = xlsx._styles(package)
@@ -143,7 +223,7 @@ def recalculate(blob: bytes, filename: str, package: Package) -> dict:
     for sheet in xlsx.sheet_map(package):
         xml = package.parts()[sheet.path]
         root = parse_xml(xml, sheet.path)
-        current = xml
+        updates: dict[str, tuple[str, str]] = {}
         for cell in xlsx._read_cells(root, strings, formats):
             if cell.get("formula") is None:
                 continue
@@ -157,7 +237,7 @@ def recalculate(blob: bytes, filename: str, package: Package) -> dict:
                 old_type = "b"
             if _same(None if cell.get("raw_value") is None else str(cell.get("raw_value")), old_type, kind, raw):
                 continue
-            current = _patch_cache(current, cell["ref"], kind, raw)
+            updates[cell["ref"]] = (kind, raw)
             changes.append(
                 {
                     "sheet": sheet.name,
@@ -169,8 +249,8 @@ def recalculate(blob: bytes, filename: str, package: Package) -> dict:
                     "source": "LibreOffice",
                 }
             )
-        if current != xml:
-            replacements[sheet.path] = current
+        if updates:
+            replacements[sheet.path] = _patch_many(xml, updates)
     from .engine import propose_parts
 
     if not changes:

@@ -1,5 +1,6 @@
 import hashlib
 import io
+import time
 import zipfile
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from stetwise.engine import dispatch, propose, search, inspect
 from stetwise.errors import StetwiseRefusal
 from stetwise.refs import Shift, shift_formula
 from stetwise.zippack import read_package, write_package
-from build_fixtures import contract_docx, model_xlsx, settings_docx, stale_xlsx, strings_xlsx, table_xlsx
+from build_fixtures import contract_docx, model_xlsx, settings_docx, stale_xlsx, strings_xlsx, table_xlsx, types_xlsx
 
 POI = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "poi"
 
@@ -37,6 +38,23 @@ def _part(blob: bytes, name: str) -> bytes:
 
 def _compressed(blob: bytes, name: str) -> bytes:
     return read_package(blob).by_name()[name].compressed
+
+
+def _soffice_orphans() -> list[str]:
+    found = []
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return found
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "stetwise-lo-" in command:
+            found.append(command)
+    return found
 
 
 def test_formula_shift_rules():
@@ -494,6 +512,54 @@ def test_recalculate_patches_cached_values_on_a_copy():
     word = dispatch({"action": "recalculate", "filename": "contract.docx", "data_b64": _b64(contract_docx())})
     assert word["ok"] is False
     assert word["error"]["code"] == "wrong_kind"
+    assert word["error"]["started"] is False
+    assert _soffice_orphans() == []
+
+
+def test_recalculate_keeps_date_serials_and_typed_caches():
+    poi = POI.joinpath("50755_workday_formula_example.xlsx").read_bytes()
+    kept = dispatch({"action": "recalculate", "filename": "50755_workday_formula_example.xlsx", "data_b64": _b64(poi)})
+    assert kept["ok"] is True, kept
+    assert kept["result"]["changed"] is False
+    poi_sheet = _part(poi, "xl/worksheets/sheet1.xml")
+    assert b"8-Feb-11" not in poi_sheet
+    assert b"<v>40582</v>" in poi_sheet
+    original = types_xlsx()
+    response = dispatch({"action": "recalculate", "filename": "types.xlsx", "data_b64": _b64(original)})
+    assert response["ok"] is True, response
+    result = response["result"]
+    assert result["changed"] is True
+    edited = _bytes(result)
+    sheet = _part(edited, "xl/worksheets/sheet1.xml")
+    assert b"8-Feb-11" not in sheet
+    assert b"Feb" not in sheet
+    assert b"<f>DATE(2011,2,8)</f>" in sheet
+    assert b"<v>40582</v>" in sheet
+    assert b"<f>1234.5</f>" in sheet
+    assert b"<v>1234.5</v>" in sheet
+    assert b"<f>1/4</f>" in sheet
+    assert b"<v>0.25</v>" in sheet
+    assert b'<c r="A4" t="b"><f>TRUE()</f><v>1</v></c>' in sheet
+    assert b"<f>1/0</f>" in sheet
+    assert b't="e"' in sheet
+    assert b"#DIV/0!" in sheet
+    assert b'<c r="A6" t="str"><f>"Hello"</f><v>Hello</v></c>' in sheet
+    assert _compressed(edited, "xl/styles.xml") == _compressed(original, "xl/styles.xml")
+    assert result["verification"]["untouched_identical"] is True
+    assert _soffice_orphans() == []
+
+
+def test_recalculate_timeout_leaves_no_soffice(monkeypatch):
+    monkeypatch.setenv("STETWISE_RECALC_TIMEOUT", "1")
+    monkeypatch.setenv("STETWISE_RECALC_HOLD", "15")
+    response = dispatch({"action": "recalculate", "filename": "stale.xlsx", "data_b64": _b64(stale_xlsx())})
+    assert response["ok"] is False
+    assert response["error"]["code"] == "recalc_failed"
+    assert response["error"]["started"] is True
+    deadline = time.time() + 5
+    while time.time() < deadline and _soffice_orphans():
+        time.sleep(0.1)
+    assert _soffice_orphans() == []
 
 
 def test_create_blank_then_edit_and_list_comments():
@@ -553,3 +619,60 @@ def test_word_paragraphs_tracking_and_run_format():
     assert b"Alpha stay" in marked_doc
     assert b"<w:trackRevisions" in marked_settings
     assert "word/settings.xml" in marked["verification"]["changed_parts"]
+    styled = _propose(original, "contract.docx", [{"op": "insert_paragraph", "anchor": "p-0", "text": "Listed item", "style": "ListParagraph"}])
+    styled_doc = _part(_bytes(styled), "word/document.xml")
+    assert b"Listed item" in styled_doc
+    assert b'w:val="ListParagraph"' in styled_doc
+    assert _compressed(_bytes(styled), "word/styles.xml") == _compressed(original, "word/styles.xml")
+    heading = _propose(original, "contract.docx", [{"op": "insert_paragraph", "anchor": "p-1", "text": "Section", "style": "Heading1"}])
+    assert b'w:val="Heading1"' in _part(_bytes(heading), "word/document.xml")
+    assert _compressed(_bytes(heading), "word/styles.xml") == _compressed(original, "word/styles.xml")
+    with pytest.raises(StetwiseRefusal) as unknown:
+        propose(original, "contract.docx", [{"op": "insert_paragraph", "anchor": "p-0", "text": "No", "style": "NoSuchStyle"}])
+    assert unknown.value.code == "unknown_style"
+    with pytest.raises(StetwiseRefusal) as character:
+        propose(original, "contract.docx", [{"op": "insert_paragraph", "anchor": "p-0", "text": "No", "style": "Emphasis"}])
+    assert character.value.code == "unknown_style"
+
+
+def test_fill_clear_and_format_font_border():
+    original = model_xlsx()
+    filled = _propose(
+        original,
+        "model.xlsx",
+        [{"op": "fill_range", "sheet": "Inputs", "range": "Z1:Z2", "formula": "A1"}],
+    )
+    sheet = _part(_bytes(filled), "xl/worksheets/sheet1.xml")
+    assert b'<c r="Z1"><f>A1</f></c>' in sheet or b'<c r="Z1"><f>A1</f>' in sheet
+    assert b"<f>A2</f>" in sheet
+    locked = _propose(
+        original,
+        "model.xlsx",
+        [{"op": "fill_range", "sheet": "Inputs", "range": "Y1:Y2", "formula": "$A$1"}],
+    )
+    locked_sheet = _part(_bytes(locked), "xl/worksheets/sheet1.xml")
+    assert locked_sheet.count(b"<f>$A$1</f>") >= 2
+    cleared = _propose(_bytes(filled), "model.xlsx", [{"op": "clear_range", "sheet": "Inputs", "range": "Z1:Z2"}])
+    gone = _part(_bytes(cleared), "xl/worksheets/sheet1.xml")
+    assert b"<f>A1</f>" not in gone
+    assert b"<f>A2</f>" not in gone
+    with pytest.raises(StetwiseRefusal) as huge:
+        propose(original, "model.xlsx", [{"op": "clear_range", "sheet": "Inputs", "range": "A1:A5001"}])
+    assert huge.value.code == "too_many"
+    cells = [{"ref": f"A{i}", "value": 1} for i in range(1, 5002)]
+    with pytest.raises(StetwiseRefusal) as too_many:
+        propose(original, "model.xlsx", [{"op": "set_cells", "sheet": "Inputs", "cells": cells}])
+    assert too_many.value.code == "too_many"
+    painted = _propose(
+        original,
+        "model.xlsx",
+        [{"op": "format_cells", "sheet": "Inputs", "refs": ["A1"], "font_size": 18, "font_color": "FF0000", "border": True}],
+    )
+    styles = _part(_bytes(painted), "xl/styles.xml")
+    assert b'<sz val="18"/>' in styles
+    assert b'rgb="FFFF0000"' in styles
+    assert b'style="thin"' in styles
+    assert b"<sz val=\"11\"/>" in styles
+    assert b"theme" not in styles.lower()
+    assert "xl/styles.xml" in painted["verification"]["changed_parts"]
+    assert painted["verification"]["untouched_identical"] is True

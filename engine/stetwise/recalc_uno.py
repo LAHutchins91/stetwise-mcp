@@ -2,6 +2,10 @@
 
 Run with a Python that can `import uno` (the engine image's distro Python).
 The parent patches those results into the original package.
+
+Result kinds come from the calculated value, not the displayed text. A date
+serial stays a number. A currency or percent stays a number. Booleans are
+numbers whose number format is logical. Errors are formula-error cells.
 """
 
 from __future__ import annotations
@@ -14,6 +18,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+# com.sun.star.util.NumberFormat.LOGICAL
+_LOGICAL = 1024
+# com.sun.star.sheet.FormulaResult.ERROR
+_FORMULA_ERROR = 4
 
 
 def _port() -> int:
@@ -32,23 +41,116 @@ def _num_text(value: float) -> str:
     return format(value, ".15g")
 
 
-def _kind(cell) -> tuple[str, str]:
-    error = int(cell.getError())
-    text = str(cell.getString() or "")
-    if error or (text.startswith("#") and text.endswith("!")):
-        return "e", text or "#VALUE!"
-    if text in {"TRUE", "FALSE"}:
-        return "b", "1" if text == "TRUE" else "0"
-    value = float(cell.getValue())
-    rendered = _num_text(value)
-    if text == rendered or text == str(value):
-        return "n", rendered
+def _colname(index: int) -> str:
+    name = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
+        name = chr(65 + rem) + name
+    return name
+
+
+def _write_pid(proc: subprocess.Popen, profile: Path) -> None:
+    path = os.environ.get("STETWISE_RECALC_PIDFILE")
+    if not path:
+        return
+    Path(path).write_text(f"{proc.pid}\n{profile}\n", encoding="utf-8")
+
+
+def _logical_boxes(doc, sheet) -> list[tuple[int, int, int, int]]:
+    """Boxes whose number format is logical. Do not expand them into cells."""
+    boxes: list[tuple[int, int, int, int]] = []
     try:
-        if abs(float(text) - value) < 1e-9:
-            return "n", rendered
-    except ValueError:
-        pass
-    return "str", text
+        unique = sheet.getUniqueCellFormatRanges()
+        # getPropertyValue("NumberFormats") is empty. The attribute is the format table.
+        formats = doc.NumberFormats
+        count = int(unique.getCount())
+    except Exception:
+        return boxes
+    for index in range(count):
+        try:
+            item = unique.getByIndex(index)
+            key = int(item.getPropertyValue("NumberFormat"))
+            info = formats.getByKey(key)
+            flags = int(info.getPropertyValue("Type"))
+            if flags & _LOGICAL == 0:
+                continue
+            for addr in item.getRangeAddresses():
+                boxes.append((int(addr.StartColumn), int(addr.StartRow), int(addr.EndColumn), int(addr.EndRow)))
+        except Exception:
+            continue
+    return boxes
+
+
+def _in_boxes(boxes: list[tuple[int, int, int, int]], col: int, row: int) -> bool:
+    for c1, r1, c2, r2 in boxes:
+        if c1 <= col <= c2 and r1 <= row <= r2:
+            return True
+    return False
+
+
+def _error_cells(rng) -> set[tuple[int, int]]:
+    found: set[tuple[int, int]] = set()
+    try:
+        hits = rng.queryFormulaCells(_FORMULA_ERROR)
+    except Exception:
+        return found
+    try:
+        addresses = hits.getRangeAddresses()
+    except Exception:
+        return found
+    for addr in addresses:
+        rows = int(addr.EndRow) - int(addr.StartRow) + 1
+        cols = int(addr.EndColumn) - int(addr.StartColumn) + 1
+        # Error results are individual formula cells. A huge span is not expanded.
+        if rows * cols > 8192:
+            continue
+        for row in range(int(addr.StartRow), int(addr.EndRow) + 1):
+            for col in range(int(addr.StartColumn), int(addr.EndColumn) + 1):
+                found.add((row, col))
+    return found
+
+
+def _sheet_cells(doc, sheet) -> dict[str, dict[str, str]]:
+    cursor = sheet.createCursor()
+    cursor.gotoEndOfUsedArea(True)
+    rows = int(cursor.Rows.Count)
+    cols = int(cursor.Columns.Count)
+    if rows < 1 or cols < 1:
+        return {}
+    rng = sheet.getCellRangeByPosition(0, 0, cols - 1, rows - 1)
+    formulas = rng.getFormulaArray()
+    data = rng.getDataArray()
+    errors = _error_cells(rng)
+    logical = _logical_boxes(doc, sheet)
+    cells: dict[str, dict[str, str]] = {}
+    for row in range(rows):
+        formula_row = formulas[row]
+        data_row = data[row]
+        for col in range(cols):
+            formula = formula_row[col]
+            if not isinstance(formula, str) or not formula.startswith("="):
+                continue
+            ref = f"{_colname(col)}{row + 1}"
+            if (row, col) in errors:
+                text = str(sheet.getCellByPosition(col, row).getString() or "")
+                cells[ref] = {"kind": "e", "raw": text or "#VALUE!"}
+                continue
+            value = data_row[col]
+            if isinstance(value, bool):
+                cells[ref] = {"kind": "b", "raw": "1" if value else "0"}
+            elif isinstance(value, float):
+                if _in_boxes(logical, col, row):
+                    cells[ref] = {"kind": "b", "raw": "1" if value != 0 else "0"}
+                else:
+                    cells[ref] = {"kind": "n", "raw": _num_text(value)}
+            elif isinstance(value, str):
+                cells[ref] = {"kind": "str", "raw": value}
+            elif value is None:
+                cells[ref] = {"kind": "n", "raw": "0"}
+            else:
+                cells[ref] = {"kind": "str", "raw": str(value)}
+    return cells
 
 
 def main() -> None:
@@ -77,6 +179,11 @@ def main() -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    # The pid file exists before any calculation so a parent timeout can reap this group.
+    _write_pid(proc, profile)
+    hold = os.environ.get("STETWISE_RECALC_HOLD") or ""
+    if hold:
+        time.sleep(float(hold))
     try:
         local = uno.getComponentContext()
         resolver = local.ServiceManager.createInstanceWithContext("com.sun.star.bridge.UnoUrlResolver", local)
@@ -104,21 +211,7 @@ def main() -> None:
         doc.calculateAll()
         sheets: dict[str, dict[str, dict[str, str]]] = {}
         for sheet in doc.Sheets:
-            cells: dict[str, dict[str, str]] = {}
-            cursor = sheet.createCursor()
-            cursor.gotoEndOfUsedArea(True)
-            rows = int(cursor.Rows.Count)
-            cols = int(cursor.Columns.Count)
-            for row in range(rows):
-                for col in range(cols):
-                    cell = sheet.getCellByPosition(col, row)
-                    formula = str(cell.getFormula() or "")
-                    if not formula.startswith("="):
-                        continue
-                    kind, raw = _kind(cell)
-                    ref = cell.AbsoluteName.split(".")[-1].replace("$", "")
-                    cells[ref] = {"kind": kind, "raw": raw}
-            sheets[str(sheet.Name)] = cells
+            sheets[str(sheet.Name)] = _sheet_cells(doc, sheet)
         doc.close(False)
         dest.write_text(json.dumps({"sheets": sheets}), encoding="utf-8")
     finally:
@@ -129,7 +222,10 @@ def main() -> None:
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 if __name__ == "__main__":

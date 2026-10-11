@@ -87,11 +87,29 @@ def search(blob: bytes, filename: str, query: str, limit: int = 50) -> dict:
     return xlsx.search_xlsx(package, query, limit)
 
 
+def _proposal_cells(ops: list[dict]) -> int:
+    from .refs import split_ref
+
+    total = 0
+    for op in ops:
+        name = op.get("op")
+        if name == "set_cells":
+            total += len(op.get("cells") or [])
+        elif name == "format_cells":
+            total += len(op.get("refs") or [])
+        elif name in {"clear_range", "fill_range"}:
+            c1, r1, c2, r2 = split_ref(str(op.get("range") or ""))
+            total += (c2 - c1 + 1) * (r2 - r1 + 1)
+    return total
+
+
 def propose(blob: bytes, filename: str, ops: list[dict]) -> dict:
     if not ops:
         raise StetwiseRefusal("propose_edit needs at least one operation.", "empty_edit")
     if len(ops) > 20:
         raise StetwiseRefusal("v1 accepts at most 20 operations in one proposal.", "too_many")
+    if _proposal_cells(ops) > 5000:
+        raise StetwiseRefusal("v1 accepts at most 5000 cells in one proposal.", "too_many")
     kind = detect(blob, filename)
     current = blob
     diffs: list[dict] = []
@@ -169,7 +187,9 @@ def _one(package, kind: str, op: dict):
                 package, int(op.get("table") or 0), op.get("cells") or [], track_changes=_track(op)
             )
         if name == "insert_paragraph":
-            return docx.insert_paragraph(package, op.get("anchor") or "", op.get("text") or "", track_changes=_track(op))
+            return docx.insert_paragraph(
+                package, op.get("anchor") or "", op.get("text") or "", track_changes=_track(op), style=op.get("style")
+            )
         if name == "delete_paragraph":
             return docx.delete_paragraph(package, op.get("anchor") or "", track_changes=_track(op))
         if name == "format_runs":
@@ -181,7 +201,7 @@ def _one(package, kind: str, op: dict):
                 underline=op.get("underline"),
                 occurrence=op.get("occurrence"),
             )
-        if name in {"set_cells", "insert_rows", "insert_cols", "format_cells"}:
+        if name in {"set_cells", "insert_rows", "insert_cols", "format_cells", "clear_range", "fill_range"}:
             raise StetwiseRefusal(f"{name} is an Excel operation and this file is a Word document.", "wrong_kind")
         raise StetwiseRefusal(f"Unknown operation {name!r}.", "unknown_op")
     if name == "set_cells":
@@ -194,6 +214,16 @@ def _one(package, kind: str, op: dict):
         return xlsx.replace_text(package, op.get("find") or "", op.get("replace") or "", op.get("occurrence"))
     if name == "format_cells":
         return xlsx.format_cells(package, op.get("sheet") or "", op.get("refs") or [], op)
+    if name == "clear_range":
+        return xlsx.clear_range(package, op.get("sheet") or "", op.get("range") or "")
+    if name == "fill_range":
+        return xlsx.fill_range(
+            package,
+            op.get("sheet") or "",
+            op.get("range") or "",
+            value=op.get("value") if "value" in op else None,
+            formula=op.get("formula") if "formula" in op else None,
+        )
     if name in {"replace_paragraph", "update_table_cells", "insert_paragraph", "delete_paragraph", "format_runs"}:
         raise StetwiseRefusal(f"{name} is a Word operation and this file is a workbook.", "wrong_kind")
     raise StetwiseRefusal(f"Unknown operation {name!r}.", "unknown_op")
@@ -321,7 +351,7 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
             return {"ok": True, "result": propose(blob, filename, payload.get("ops") or [])}
         raise StetwiseRefusal(f"Unknown action {action!r}.", "unknown_action")
     except StetwiseError as exc:
-        return {"ok": False, "error": {"code": exc.code, "reason": exc.reason}}
+        return {"ok": False, "error": {"code": exc.code, "reason": exc.reason, "started": bool(exc.started)}}
     except Exception:
         return {
             "ok": False,

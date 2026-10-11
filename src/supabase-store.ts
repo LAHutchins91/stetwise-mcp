@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { supabaseServiceKey, supabaseUrl } from "./config.js";
 import { ToolError } from "./errors.js";
+import { headCacheClear, headCacheDropFile, headCacheDropOwner, headCacheGet, headCachePut, headCacheTouch, headKey, noteDiskRead } from "./head-cache.js";
 import {
   emptyUsage,
   entitled,
@@ -11,6 +12,7 @@ import {
   planCaps,
   QuotaError,
   tierFor,
+  usageUnits,
   usageView,
   type PlanTier,
   type UsageCounts,
@@ -164,7 +166,8 @@ function countsFrom(row: Row | null): UsageCounts {
   return {
     edits: Number(row.edits ?? 0),
     files: Number(row.files ?? 0),
-    recalculations: Number(row.recalculations ?? 0)
+    recalculations: Number(row.recalculations ?? 0),
+    proposals: Number(row.proposals ?? 0)
   };
 }
 
@@ -195,8 +198,21 @@ export class SupabaseStore implements Store {
     });
     if (response.status === 404) throw new ToolError("The file bytes are no longer available.", "missing_bytes");
     if (!response.ok) throwMapped(await response.text());
+    noteDiskRead();
     const bytes = Buffer.from(await response.arrayBuffer());
     if (sha256(bytes) !== hash) throw new ToolError("Stored bytes did not match their hash.", "bad_hash");
+    return bytes;
+  }
+
+  private async cachedDownload(ownerId: string, fileId: string, hash: string, expiresAt: string): Promise<Buffer> {
+    const key = headKey(ownerId, fileId, hash);
+    const hit = headCacheGet(key);
+    if (hit) {
+      headCacheTouch(key, expiresAt);
+      return hit;
+    }
+    const bytes = await this.downloadBlob(ownerId, hash);
+    headCachePut(key, bytes, expiresAt);
     return bytes;
   }
 
@@ -291,7 +307,7 @@ export class SupabaseStore implements Store {
     const profile = await this.requireProfile(ownerId);
     const rows = await rest<Row[]>(
       "GET",
-      `/rest/v1/usage_monthly?owner_id=eq.${encodeURIComponent(ownerId)}&month=eq.${monthKey(now)}&select=edits,files,recalculations`
+      `/rest/v1/usage_monthly?owner_id=eq.${encodeURIComponent(ownerId)}&month=eq.${monthKey(now)}&select=edits,files,recalculations,proposals`
     );
     return usageView(tierFor(profile), countsFrom(rows[0] ?? null), profile.retention_hours, now);
   }
@@ -300,7 +316,7 @@ export class SupabaseStore implements Store {
     const month = monthKey(now);
     const rows = await rest<Row[]>(
       "GET",
-      `/rest/v1/usage_monthly?owner_id=eq.${encodeURIComponent(ownerId)}&month=eq.${month}&select=edits,files,recalculations`
+      `/rest/v1/usage_monthly?owner_id=eq.${encodeURIComponent(ownerId)}&month=eq.${month}&select=edits,files,recalculations,proposals`
     );
     const current = countsFrom(rows[0] ?? null);
     await rest("POST", "/rest/v1/usage_monthly", {
@@ -308,7 +324,8 @@ export class SupabaseStore implements Store {
       month,
       edits: counts.edits ?? current.edits,
       files: counts.files ?? current.files,
-      recalculations: counts.recalculations ?? current.recalculations
+      recalculations: counts.recalculations ?? current.recalculations,
+      proposals: counts.proposals ?? current.proposals
     }, { Prefer: "resolution=merge-duplicates", on_conflict: "owner_id,month" });
   }
 
@@ -419,7 +436,7 @@ export class SupabaseStore implements Store {
       `/rest/v1/proposals?owner_id=eq.${encodeURIComponent(ownerId)}&file_id=eq.${encodeURIComponent(file.id)}&result_sha=eq.${hash}&expires_at=gt.${encodeURIComponent(now)}&select=id&limit=1`
     );
     if (versions.length === 0 && proposals.length === 0) throw new ToolError("That version is not part of this file.", "not_found");
-    return { bytes: await this.downloadBlob(ownerId, hash), file };
+    return { bytes: await this.cachedDownload(ownerId, file.id, hash, file.expiresAt), file };
   }
 
   async readBytes(ownerId: string, fileId: string, hash?: string): Promise<{ bytes: Buffer; file: FileRow }> {
@@ -431,7 +448,7 @@ export class SupabaseStore implements Store {
     );
     if (known.length === 0) throw new ToolError("That version is not part of this file.", "not_found");
     const touched = await this.touch(file);
-    return { bytes: await this.downloadBlob(ownerId, sha), file: touched };
+    return { bytes: await this.cachedDownload(ownerId, touched.id, sha, touched.expiresAt), file: touched };
   }
 
   async listVersions(ownerId: string, fileId: string): Promise<VersionSummary[]> {
@@ -462,6 +479,15 @@ export class SupabaseStore implements Store {
     verification: unknown;
   }): Promise<ProposalRow> {
     if (sha256(input.bytes) !== input.resultSha) throw new ToolError("Bad content hash.", "bad_hash");
+    const profile = await this.requireEntitled(input.ownerId);
+    const tier = tierFor(profile);
+    const file = await this.liveFile(input.ownerId, input.fileId);
+    const now = new Date();
+    const units = usageUnits(file.size);
+    const view = await this.usage(input.ownerId, now);
+    if (view.proposals.used + units > view.proposals.cap) {
+      throw new QuotaError("proposals", view.proposals.used, view.proposals.cap, tier, now, units);
+    }
     await this.uploadBlob(input.ownerId, input.resultSha, input.bytes);
     const row = await rpc<Row>("stetwise_save_proposal", {
       p_id: crypto.randomUUID(),
@@ -473,9 +499,14 @@ export class SupabaseStore implements Store {
       p_diff: input.diff ?? [],
       p_warnings: input.warnings ?? [],
       p_verification: input.verification ?? {},
-      p_now: new Date().toISOString()
+      p_now: now.toISOString(),
+      p_month: monthKey(now),
+      p_proposals_cap: planCaps(tier).proposals,
+      p_tier: tier
     });
-    return proposalFrom(row);
+    const proposal = proposalFrom(row);
+    headCachePut(headKey(input.ownerId, file.id, input.resultSha), input.bytes, file.expiresAt);
+    return proposal;
   }
 
   async getProposal(ownerId: string, proposalId: string): Promise<ProposalRow> {
@@ -502,23 +533,25 @@ export class SupabaseStore implements Store {
     return this.publishFrom(row, tier, now);
   }
 
-  async recordRecalculation(ownerId: string, now = new Date()) {
+  async recordRecalculation(ownerId: string, now = new Date(), sizeBytes = 1) {
     const profile = await this.requireEntitled(ownerId);
     const tier = tierFor(profile);
     const row = await rpc<Row>("stetwise_record_recalculation", {
       p_owner: ownerId,
       p_month: monthKey(now),
       p_cap: planCaps(tier).recalculations,
-      p_tier: tier
+      p_tier: tier,
+      p_units: usageUnits(sizeBytes)
     });
     return usageView(tier, countsFrom(row), profile.retention_hours, now);
   }
 
-  async assertRecalcAllowed(ownerId: string, now = new Date()): Promise<void> {
+  async assertRecalcAllowed(ownerId: string, now = new Date(), sizeBytes = 1): Promise<void> {
     const profile = await this.requireEntitled(ownerId);
     const view = await this.usage(ownerId, now);
-    if (view.recalculations.remaining <= 0) {
-      throw new QuotaError("recalculations", view.recalculations.used, view.recalculations.cap, tierFor(profile), now);
+    const units = usageUnits(sizeBytes);
+    if (view.recalculations.used + units > view.recalculations.cap) {
+      throw new QuotaError("recalculations", view.recalculations.used, view.recalculations.cap, tierFor(profile), now, units);
     }
   }
 
@@ -542,6 +575,7 @@ export class SupabaseStore implements Store {
       { Prefer: "return=representation" }
     );
     if (!rows?.length) throw new ToolError("File not found.", "not_found");
+    headCacheDropFile(ownerId, fileId);
     await this.audit({ ownerId, op: "delete_file", fileId, code: "ok" });
   }
 
@@ -549,6 +583,7 @@ export class SupabaseStore implements Store {
     const rows = await rest<Row[]>("DELETE", `/rest/v1/files?owner_id=eq.${encodeURIComponent(ownerId)}`, undefined, {
       Prefer: "return=representation"
     });
+    headCacheDropOwner(ownerId);
     await this.audit({ ownerId, op: "delete_all", code: "ok" });
     return rows?.length ?? 0;
   }
@@ -568,6 +603,7 @@ export class SupabaseStore implements Store {
       // The explicit drop list still removes blobs the database released.
     }
     const blobs = await this.deleteBlobs(paths);
+    headCacheClear();
     return { files: Number(row.files ?? 0), blobs };
   }
 

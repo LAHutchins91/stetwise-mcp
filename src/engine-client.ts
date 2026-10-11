@@ -4,7 +4,7 @@ import path from "node:path";
 import { repoRoot } from "./config.js";
 import { ToolError } from "./errors.js";
 
-export type EngineFailure = { ok: false; error: { code: string; reason: string } };
+export type EngineFailure = { ok: false; error: { code: string; reason: string; started?: boolean } };
 export type EngineSuccess<T> = { ok: true; result: T };
 export type EngineResponse<T> = EngineSuccess<T> | EngineFailure;
 
@@ -19,7 +19,7 @@ export async function engineCall<T>(payload: Record<string, unknown>): Promise<T
   if (!body.ok) {
     const code = body.error?.code || "refused";
     const reason = body.error?.reason || "The file engine refused this request. The file was not changed.";
-    throw new ToolError(reason, code);
+    throw new ToolError(reason, code, Boolean(body.error?.started));
   }
   return body.result;
 }

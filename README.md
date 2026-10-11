@@ -66,7 +66,7 @@ See `.env.example`. Names only:
 | `OPENAI_APPS_CHALLENGE` | Optional ChatGPT domain check. |
 | `PORT` | HTTP port. Default `3000`. |
 
-Checkout sends `line_items[0][price]` set to `STRIPE_PRICE_MONTHLY` or `STRIPE_PRICE_YEARLY`. It sets `subscription_data[trial_period_days]` to 14. It does not create a product or a price, and it does not send an amount. Stripe shows the amount. While `subscription_status` is `trialing`, the server enforces the trial caps below (100 applied edits and 20 recalculations), even if the Stripe plan name is already Pro. An `active` subscription uses the Pro caps. Past a cap the call is blocked. There is no overage charge.
+Checkout sends `line_items[0][price]` set to `STRIPE_PRICE_MONTHLY` or `STRIPE_PRICE_YEARLY`. It sets `subscription_data[trial_period_days]` to 14. It does not create a product or a price, and it does not send an amount. Stripe shows the amount. While `subscription_status` is `trialing`, the server enforces the trial caps below (100 applied edits, 20 recalculations, and 200 proposals), even if the Stripe plan name is already Pro. An `active` subscription uses the Pro caps. Past a cap the call is blocked. There is no overage charge.
 
 Monthly caps, overridable without a code change:
 
@@ -74,14 +74,18 @@ Monthly caps, overridable without a code change:
 |---|---|
 | `STETWISE_CAP_PRO_EDITS` | 1000 |
 | `STETWISE_CAP_PRO_FILES` | 250 |
-| `STETWISE_CAP_PRO_RECALCS` | 200 |
+| `STETWISE_CAP_PRO_RECALCS` | 100 |
+| `STETWISE_CAP_PRO_PROPOSALS` | 2000 |
 | `STETWISE_CAP_PRO_MAX_BYTES` | 26214400 (25 × 1024 × 1024) |
 | `STETWISE_CAP_TRIAL_EDITS` | 100 |
 | `STETWISE_CAP_TRIAL_FILES` | 25 |
 | `STETWISE_CAP_TRIAL_RECALCS` | 20 |
+| `STETWISE_CAP_TRIAL_PROPOSALS` | 200 |
 | `STETWISE_CAP_TRIAL_MAX_BYTES` | 26214400 |
+| `STETWISE_HEAD_CACHE_BYTES` | 67108864 |
+| `STETWISE_RECALC_TIMEOUT` | 60 seconds |
 
-Trial file cap defaults to 25 new files per UTC month. Pro is 250. A trialing subscription uses the trial caps. An active subscription uses the Pro caps, including a yearly plan. Counters are per user and per UTC month. Deleting a file does not refund that month's file count. Restore does not count as an applied edit. A refused recalculation does not count.
+Each started 5 MB of a file counts as one unit toward files, applied edits, recalculations, and proposals. A 25 MB file counts as 5. A call that would pass the cap is blocked entirely. Trial file cap defaults to 25 new files per UTC month. Pro is 250. A trialing subscription uses the trial caps. An active subscription uses the Pro caps, including a yearly plan. Counters are per user and per UTC month. Deleting a file does not refund that month's file count. Restore does not count as an applied edit. A recalculation counts when LibreOffice starts, whether it finishes or not. A refusal before LibreOffice starts (not a workbook, no formulas, or LibreOffice is missing) does not count. A proposal counts when it is saved. An unchanged recalculation does not save a proposal.
 
 Files expire 24 hours after last use. `set_retention` accepts 24 or 168 (7 days). `POST /internal/purge` with header `x-stetwise-purge` deletes expired rows and unreferenced blobs. Schedule that call on the file host. It does not create cloud resources by itself.
 
@@ -124,10 +128,10 @@ Do not deploy from this repository. Do not create Stripe products or prices. Che
 ## What works in v1
 
 - Inspect, read a range or section, and search `.xlsx`, `.xlsm`, and `.docx`.
-- `propose_edit` then `apply_edit` for `set_cells` (including Excel table body cells and shared formulas), `insert_rows`, `insert_cols`, Excel `replace_text` on text values, `format_cells`, Word `replace_text`, `replace_paragraph`, `update_table_cells`, `insert_paragraph`, `delete_paragraph`, and `format_runs`.
+- `propose_edit` then `apply_edit` for `set_cells` (including Excel table body cells and shared formulas), `clear_range`, `fill_range`, `insert_rows`, `insert_cols`, Excel `replace_text` on text values, `format_cells` (number format, bold, italic, fill, alignment, column width, font size, font colour, and a thin border), Word `replace_text`, `replace_paragraph`, `update_table_cells`, `insert_paragraph` (including a paragraph style already defined in the document), `delete_paragraph`, and `format_runs`. One proposal can touch at most 5000 cells.
 - `create_file` for a blank `.xlsx` or `.docx`, then the same propose and apply flow.
 - `list_comments` to read Word comments without changing the file.
-- `recalculate` runs LibreOffice on a copy and previews cached formula values. Apply that proposal to keep them. Undo restores the previous bytes.
+- `recalculate` runs LibreOffice on a copy and previews cached formula values. Dates, currency, and percents stay numbers. Booleans, errors, and strings keep their own cell types. Apply that proposal to keep them. Undo restores the previous bytes. The current head is cached between propose and apply, and dropped when the file expires or is deleted.
 - Word edits are direct when tracking is off. Pass `track_changes: true`, or edit a document that already has tracking on, and the same change is written as `w:ins` / `w:del` by Stetwise.
 - Versions, undo, and a signed download link.
 - ChatGPT file import (`import_file`) and a signed upload link for other clients.
@@ -147,7 +151,7 @@ Do not deploy from this repository. Do not create Stripe products or prices. Che
 - A shared formula whose master formula is missing. v1 will not invent it. A solid row or column can shrink or promote a neighbor; a cell in the middle is unshared into explicit formulas.
 - Word edits while the document is protected.
 - Rewriting an existing tracked change, or accepting and rejecting someone else's revisions.
-- Rewriting comments, headers, footers, footnotes, endnotes, `word/styles.xml`, or the theme. `list_comments` is read-only. `format_cells` and `format_runs` append or set direct formatting and leave the theme alone.
+- Rewriting comments, headers, footers, footnotes, endnotes, `word/styles.xml`, or the theme. `list_comments` is read-only. `insert_paragraph` can select a paragraph style that already exists, including a heading or list style, and will not create or edit one. `format_cells` and `format_runs` append or set direct formatting and leave the theme alone.
 - Excel `replace_text` on formula text. Only cached text values change, and `sharedStrings.xml` stays byte-for-byte identical.
 - PDF or PNG previews.
 - Private, loopback, and link-local download URLs.
@@ -161,4 +165,4 @@ Do not deploy from this repository. Do not create Stripe products or prices. Che
 - The engine port must not be public. Require `ENGINE_HMAC_SECRET` and a network policy.
 - DNS rebinding between the address check and the connection is still possible. Hosts that resolve to private addresses are refused at check time.
 - `openpyxl` is not used. Whole-workbook saves drop shapes and pivots, so edits stay at the package and XML part.
-- `npm run benchmark` writes `BENCHMARKS.md` with CPU time and peak memory for inspect, propose, apply, and restore. Those numbers are from the machine that ran the script.
+- `npm run benchmark` writes `BENCHMARKS.md` with CPU time and peak memory for inspect, propose, apply, restore, and recalculate. Those numbers are from the machine that ran the script. `python3 scripts/benchmark.py --recalc-only` refreshes only the recalculate section.

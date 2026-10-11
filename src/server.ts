@@ -181,7 +181,7 @@ ${landingConnectLead(appBaseUrl())}
 <section class="plans" id="plans"><article><h2>Monthly</h2><p>14-day trial, then Pro. Stripe shows the amount before you pay.</p><button class="checkout" data-plan="monthly">Start monthly trial</button></article>
 <article><h2>Yearly</h2><p>The same trial and the same caps, billed once a year. Stripe shows the amount before you pay.</p><button class="checkout" data-plan="annual">Start yearly trial</button></article></section>
 <p id="message" role="status"></p>
-<p>Trial: 100 applied edits, 25 new files, and 20 recalculations per UTC month. Pro: 1,000 applied edits, 250 new files, and 200 recalculations. Files stay at or under 25 MB. Past a cap, the call is blocked and nothing extra is billed. Files expire 24 hours after last use, or after 7 days if you choose that.</p>
+<p>Trial: 100 applied edits, 25 new files, 200 proposals, and 20 recalculations per UTC month. Pro: 1,000 applied edits, 250 new files, 2,000 proposals, and 100 recalculations. Each started 5 MB of a file counts as one unit. Files stay at or under 25 MB. Past a cap, the call is blocked and nothing extra is billed. Files expire 24 hours after last use, or after 7 days if you choose that.</p>
 <p><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> · <a href="/support">Support</a> · <a href="mailto:ouroborosplugins@gmail.com">ouroborosplugins@gmail.com</a></p>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.115.0/dist/umd/supabase.js"></script>
 <script>

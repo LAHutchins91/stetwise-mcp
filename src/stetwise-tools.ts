@@ -36,10 +36,15 @@ const operation = z
       "insert_paragraph",
       "delete_paragraph",
       "format_cells",
-      "format_runs"
+      "format_runs",
+      "clear_range",
+      "fill_range"
     ]),
     sheet: z.string().max(200).optional(),
-    cells: z.array(cell).max(500).optional(),
+    cells: z.array(cell).max(5000).optional(),
+    range: z.string().max(64).optional(),
+    formula: z.string().max(8000).optional(),
+    value: z.union([z.string().max(8000), z.number(), z.boolean(), z.null()]).optional(),
     row: z.number().int().positive().optional(),
     column: z.string().max(8).optional(),
     count: z.number().int().min(1).max(1000).optional(),
@@ -50,14 +55,18 @@ const operation = z
     text: z.string().max(20000).optional(),
     table: z.number().int().min(0).max(500).optional(),
     track_changes: z.boolean().optional(),
-    refs: z.array(z.string().max(32)).max(500).optional(),
+    refs: z.array(z.string().max(32)).max(5000).optional(),
     bold: z.boolean().optional(),
     italic: z.boolean().optional(),
     underline: z.boolean().optional(),
     fill: z.string().regex(/^[0-9A-Fa-f]{6}$/).optional(),
     number_format: z.string().max(80).optional(),
     horizontal: z.enum(["left", "center", "right"]).optional(),
-    column_width: z.number().positive().max(255).optional()
+    column_width: z.number().positive().max(255).optional(),
+    font_size: z.number().positive().max(409).optional(),
+    font_color: z.string().regex(/^[0-9A-Fa-f]{6}$/).optional(),
+    border: z.literal(true).optional(),
+    style: z.string().max(80).optional()
   })
   .strict();
 
@@ -139,7 +148,13 @@ export function createStetwiseServer(ownerId: string) {
     );
   }
 
-  tool("get_usage", "Monthly applied-edit, file, and recalculation usage for this account. There is no overage charge.", {}, read, async () => store.usage(ownerId));
+  tool(
+    "get_usage",
+    "Monthly applied-edit, file, recalculation, and proposal usage for this account. Each started 5 MB of a file counts as one unit. There is no overage charge.",
+    {},
+    read,
+    async () => store.usage(ownerId)
+  );
 
   tool(
     "set_retention",
@@ -428,18 +443,26 @@ export function createStetwiseServer(ownerId: string) {
 
   tool(
     "recalculate",
-    "Recalculate formulas with LibreOffice on a copy and preview the cached values. Apply the proposal to keep them. A failed or refused run does not count against the monthly cap.",
+    "Recalculate formulas with LibreOffice on a copy and preview the cached values. Apply the proposal to keep them. The run counts when LibreOffice starts, including a timeout or failure. A refusal before LibreOffice starts does not count.",
     { file_id: fileId },
     write,
     async ({ file_id: id }) => {
-      await store.assertRecalcAllowed(ownerId);
       const loaded = await store.readBytes(ownerId, String(id));
-      const preview = await engineCall<ProposeResult & { changed?: boolean; label?: string }>({
-        action: "recalculate",
-        filename: loaded.file.filename,
-        data_b64: loaded.bytes.toString("base64")
-      });
-      const usage = await store.recordRecalculation(ownerId);
+      await store.assertRecalcAllowed(ownerId, new Date(), loaded.file.size);
+      let preview: ProposeResult & { changed?: boolean; label?: string };
+      try {
+        preview = await engineCall<ProposeResult & { changed?: boolean; label?: string }>({
+          action: "recalculate",
+          filename: loaded.file.filename,
+          data_b64: loaded.bytes.toString("base64")
+        });
+      } catch (error) {
+        if (error instanceof ToolError && error.started) {
+          await store.recordRecalculation(ownerId, new Date(), loaded.file.size);
+        }
+        throw error;
+      }
+      const usage = await store.recordRecalculation(ownerId, new Date(), loaded.file.size);
       if (!preview.changed || !preview.data_b64) {
         return {
           file_id: id,

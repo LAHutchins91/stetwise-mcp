@@ -131,6 +131,12 @@ def contract_docx() -> bytes:
   <w:style w:type="paragraph" w:styleId="Normal">
     <w:name w:val="Normal"/>
   </w:style>
+  <w:style w:type="paragraph" w:styleId="ListParagraph">
+    <w:name w:val="List Paragraph"/>
+  </w:style>
+  <w:style w:type="character" w:styleId="Emphasis">
+    <w:name w:val="Emphasis"/>
+  </w:style>
 </w:styles>
 """
     comments = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -306,6 +312,73 @@ def stale_xlsx() -> bytes:
   <sheetData>
     <row r="1"><c r="A1"><v>10</v></c><c r="B1"><v>5</v></c></row>
     <row r="2"><c r="A2"><f>A1+B1</f><v>0</v></c><c r="B2"><f>A1/0</f><v>1</v></c></row>
+  </sheetData>
+</worksheet>
+"""
+    return _zip(
+        {
+            "[Content_Types].xml": content_types,
+            "_rels/.rels": rels,
+            "xl/_rels/workbook.xml.rels": workbook_rels,
+            "xl/workbook.xml": workbook,
+            "xl/styles.xml": styles,
+            "xl/worksheets/sheet1.xml": sheet,
+        }
+    )
+
+
+def types_xlsx() -> bytes:
+    """Formulas with wrong caches: date, currency, percent, boolean, error, and string."""
+    content_types = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="{NS_CT}">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>
+"""
+    rels = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="{NS_REL}">
+  <Relationship Id="rId1" Type="{NS_OFF}/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>
+"""
+    workbook_rels = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="{NS_REL}">
+  <Relationship Id="rId1" Type="{NS_OFF}/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="{NS_OFF}/styles" Target="styles.xml"/>
+</Relationships>
+"""
+    workbook = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="{NS_X}" xmlns:r="{NS_OFF}">
+  <sheets><sheet name="Types" sheetId="1" r:id="rId1"/></sheets>
+  <calcPr calcId="191029"/>
+</workbook>
+"""
+    styles = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="{NS_X}">
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+  <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+  <borders count="1"><border/></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="4">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+    <xf numFmtId="14" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="7" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="10" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+  </cellXfs>
+</styleSheet>
+"""
+    sheet = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="{NS_X}">
+  <dimension ref="A1:A6"/>
+  <sheetData>
+    <row r="1"><c r="A1" s="1"><f>DATE(2011,2,8)</f><v>0</v></c></row>
+    <row r="2"><c r="A2" s="2"><f>1234.5</f><v>0</v></c></row>
+    <row r="3"><c r="A3" s="3"><f>1/4</f><v>0</v></c></row>
+    <row r="4"><c r="A4"><f>TRUE()</f><v>0</v></c></row>
+    <row r="5"><c r="A5"><f>1/0</f><v>1</v></c></row>
+    <row r="6"><c r="A6"><f>"Hello"</f><v>0</v></c></row>
   </sheetData>
 </worksheet>
 """

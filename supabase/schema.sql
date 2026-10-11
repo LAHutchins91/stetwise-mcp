@@ -24,8 +24,11 @@ create table if not exists public.usage_monthly (
   edits integer not null default 0 check (edits >= 0),
   files integer not null default 0 check (files >= 0),
   recalculations integer not null default 0 check (recalculations >= 0),
+  proposals integer not null default 0 check (proposals >= 0),
   primary key (owner_id, month)
 );
+
+alter table public.usage_monthly add column if not exists proposals integer not null default 0;
 
 create table if not exists public.files (
   id uuid primary key,
@@ -148,12 +151,27 @@ begin
 end;
 $$;
 
+-- 5 MiB. Each started unit of a file counts as one toward files, edits, recalculations, and proposals.
+create or replace function public.stetwise_usage_units(p_size integer)
+returns integer
+language sql
+immutable
+as $$
+  select case
+    when p_size is null or p_size <= 0 then 1
+    else ceil(p_size::numeric / 5242880)::integer
+  end;
+$$;
+
+drop function if exists public.stetwise_bump(uuid, text, text, integer, text);
+
 create or replace function public.stetwise_bump(
   p_owner uuid,
   p_month text,
   p_metric text,
   p_cap integer,
-  p_tier text
+  p_tier text,
+  p_units integer
 ) returns integer
 language plpgsql
 security definer
@@ -162,31 +180,43 @@ as $$
 declare
   used integer;
 begin
+  if p_units is null or p_units < 1 then
+    raise exception 'stetwise:bad_metric' using errcode = 'P0001';
+  end if;
   insert into public.usage_monthly (owner_id, month)
   values (p_owner, p_month)
   on conflict (owner_id, month) do nothing;
 
   if p_metric = 'edits' then
     select edits into used from public.usage_monthly where owner_id = p_owner and month = p_month for update;
-    if used >= p_cap then
+    if used + p_units > p_cap then
       raise exception 'stetwise:usage_cap:edits:%:%:%', used, p_cap, p_tier using errcode = 'P0001';
     end if;
-    update public.usage_monthly set edits = edits + 1 where owner_id = p_owner and month = p_month returning edits into used;
+    update public.usage_monthly set edits = edits + p_units where owner_id = p_owner and month = p_month returning edits into used;
   elsif p_metric = 'files' then
     select files into used from public.usage_monthly where owner_id = p_owner and month = p_month for update;
-    if used >= p_cap then
+    if used + p_units > p_cap then
       raise exception 'stetwise:usage_cap:files:%:%:%', used, p_cap, p_tier using errcode = 'P0001';
     end if;
-    update public.usage_monthly set files = files + 1 where owner_id = p_owner and month = p_month returning files into used;
+    update public.usage_monthly set files = files + p_units where owner_id = p_owner and month = p_month returning files into used;
   elsif p_metric = 'recalculations' then
     select recalculations into used from public.usage_monthly where owner_id = p_owner and month = p_month for update;
-    if used >= p_cap then
+    if used + p_units > p_cap then
       raise exception 'stetwise:usage_cap:recalculations:%:%:%', used, p_cap, p_tier using errcode = 'P0001';
     end if;
     update public.usage_monthly
-      set recalculations = recalculations + 1
+      set recalculations = recalculations + p_units
       where owner_id = p_owner and month = p_month
       returning recalculations into used;
+  elsif p_metric = 'proposals' then
+    select proposals into used from public.usage_monthly where owner_id = p_owner and month = p_month for update;
+    if used + p_units > p_cap then
+      raise exception 'stetwise:usage_cap:proposals:%:%:%', used, p_cap, p_tier using errcode = 'P0001';
+    end if;
+    update public.usage_monthly
+      set proposals = proposals + p_units
+      where owner_id = p_owner and month = p_month
+      returning proposals into used;
   else
     raise exception 'stetwise:bad_metric' using errcode = 'P0001';
   end if;
@@ -267,7 +297,7 @@ begin
     file_id := nonce_row.file_id;
     filename := nonce_row.filename;
   end if;
-  perform public.stetwise_bump(p_owner, p_month, 'files', p_files_cap, p_tier);
+  perform public.stetwise_bump(p_owner, p_month, 'files', p_files_cap, p_tier, public.stetwise_usage_units(p_size));
   if p_nonce is not null and length(p_nonce) > 0 then
     delete from public.upload_nonces where nonce = p_nonce;
   end if;
@@ -292,6 +322,8 @@ begin
 end;
 $$;
 
+drop function if exists public.stetwise_save_proposal(uuid, uuid, uuid, text, text, integer, jsonb, jsonb, jsonb, timestamptz);
+
 create or replace function public.stetwise_save_proposal(
   p_id uuid,
   p_owner uuid,
@@ -302,7 +334,10 @@ create or replace function public.stetwise_save_proposal(
   p_diff jsonb,
   p_warnings jsonb,
   p_verification jsonb,
-  p_now timestamptz
+  p_now timestamptz,
+  p_month text,
+  p_proposals_cap integer,
+  p_tier text
 ) returns jsonb
 language plpgsql
 security definer
@@ -324,6 +359,9 @@ begin
   if target.head_sha <> p_base_sha then
     raise exception 'stetwise:stale_version:propose' using errcode = 'P0001';
   end if;
+  perform public.stetwise_bump(
+    p_owner, p_month, 'proposals', p_proposals_cap, p_tier, public.stetwise_usage_units(target.size)
+  );
   target.last_used_at := p_now;
   target.expires_at := p_now + make_interval(hours => profile.retention_hours);
   update public.files
@@ -373,6 +411,7 @@ declare
   used_edits integer;
   used_files integer;
   used_recalculations integer;
+  used_proposals integer;
 begin
   profile := public.stetwise_lock_profile(p_owner);
   select * into proposal from public.proposals where id = p_proposal for update;
@@ -391,7 +430,7 @@ begin
   end if;
   select coalesce(max(number), 0) into version_number from public.file_versions where file_id = target.id;
   if proposal.applied_at is not null and target.head_sha = proposal.result_sha then
-    select u.edits, u.files, u.recalculations into used_edits, used_files, used_recalculations
+    select u.edits, u.files, u.recalculations, u.proposals into used_edits, used_files, used_recalculations, used_proposals
       from public.usage_monthly u where u.owner_id = p_owner and u.month = p_month;
     return jsonb_build_object(
       'file_id', target.id,
@@ -402,6 +441,7 @@ begin
       'edits', coalesce(used_edits, 0),
       'files', coalesce(used_files, 0),
       'recalculations', coalesce(used_recalculations, 0),
+      'proposals', coalesce(used_proposals, 0),
       'retention_hours', profile.retention_hours
     );
   end if;
@@ -411,7 +451,7 @@ begin
   if target.head_sha <> proposal.base_sha then
     raise exception 'stetwise:stale_version:current' using errcode = 'P0001';
   end if;
-  perform public.stetwise_bump(p_owner, p_month, 'edits', p_edits_cap, p_tier);
+  perform public.stetwise_bump(p_owner, p_month, 'edits', p_edits_cap, p_tier, public.stetwise_usage_units(proposal.size));
   version_number := version_number + 1;
   insert into public.file_versions (file_id, number, sha256, size, op, created_at)
   values (target.id, version_number, proposal.result_sha, proposal.size, 'apply', p_now);
@@ -422,7 +462,7 @@ begin
         expires_at = p_now + make_interval(hours => profile.retention_hours)
     where id = target.id;
   update public.proposals set applied_at = p_now where id = proposal.id;
-  select u.edits, u.files, u.recalculations into used_edits, used_files, used_recalculations
+  select u.edits, u.files, u.recalculations, u.proposals into used_edits, used_files, used_recalculations, used_proposals
     from public.usage_monthly u where u.owner_id = p_owner and u.month = p_month;
   insert into public.audit_events (owner_id, op, file_id, sha256, size, code)
   values (p_owner, 'apply_edit', target.id, proposal.result_sha, proposal.size, 'ok');
@@ -435,6 +475,7 @@ begin
     'edits', used_edits,
     'files', used_files,
     'recalculations', used_recalculations,
+    'proposals', used_proposals,
     'retention_hours', profile.retention_hours
   );
 end;
@@ -458,6 +499,7 @@ declare
   used_edits integer;
   used_files integer;
   used_recalculations integer;
+  used_proposals integer;
   month_key text;
 begin
   profile := public.stetwise_lock_profile(p_owner);
@@ -482,7 +524,7 @@ begin
         expires_at = p_now + make_interval(hours => profile.retention_hours)
     where id = target.id;
   month_key := to_char(p_now at time zone 'utc', 'YYYY-MM');
-  select u.edits, u.files, u.recalculations into used_edits, used_files, used_recalculations
+  select u.edits, u.files, u.recalculations, u.proposals into used_edits, used_files, used_recalculations, used_proposals
     from public.usage_monthly u where u.owner_id = p_owner and u.month = month_key;
   insert into public.audit_events (owner_id, op, file_id, sha256, size, code)
   values (p_owner, 'restore_version', target.id, source.sha256, source.size, 'ok');
@@ -495,16 +537,20 @@ begin
     'edits', coalesce(used_edits, 0),
     'files', coalesce(used_files, 0),
     'recalculations', coalesce(used_recalculations, 0),
+    'proposals', coalesce(used_proposals, 0),
     'retention_hours', profile.retention_hours
   );
 end;
 $$;
 
+drop function if exists public.stetwise_record_recalculation(uuid, text, integer, text);
+
 create or replace function public.stetwise_record_recalculation(
   p_owner uuid,
   p_month text,
   p_cap integer,
-  p_tier text
+  p_tier text,
+  p_units integer
 ) returns jsonb
 language plpgsql
 security definer
@@ -514,12 +560,18 @@ declare
   used_edits integer;
   used_files integer;
   used_recalculations integer;
+  used_proposals integer;
 begin
   perform public.stetwise_lock_profile(p_owner);
-  perform public.stetwise_bump(p_owner, p_month, 'recalculations', p_cap, p_tier);
-  select u.edits, u.files, u.recalculations into used_edits, used_files, used_recalculations
+  perform public.stetwise_bump(p_owner, p_month, 'recalculations', p_cap, p_tier, p_units);
+  select u.edits, u.files, u.recalculations, u.proposals into used_edits, used_files, used_recalculations, used_proposals
     from public.usage_monthly u where u.owner_id = p_owner and u.month = p_month;
-  return jsonb_build_object('edits', used_edits, 'files', used_files, 'recalculations', used_recalculations);
+  return jsonb_build_object(
+    'edits', used_edits,
+    'files', used_files,
+    'recalculations', used_recalculations,
+    'proposals', used_proposals
+  );
 end;
 $$;
 

@@ -452,10 +452,12 @@ def update_table_cells(package: Package, table: int, cells: list[dict], track_ch
     )
 
 
-def insert_paragraph(package: Package, anchor: str, text: str, track_changes: bool = False) -> EditResult:
+def insert_paragraph(
+    package: Package, anchor: str, text: str, track_changes: bool = False, style: str | None = None
+) -> EditResult:
     from .docx_ops import insert_paragraph as write_paragraph
 
-    return write_paragraph(package, anchor, text, track_changes)
+    return write_paragraph(package, anchor, text, track_changes, style)
 
 
 def delete_paragraph(package: Package, anchor: str, track_changes: bool = False) -> EditResult:

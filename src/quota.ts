@@ -8,14 +8,23 @@ export const RETENTION_DEFAULT_HOURS = 24;
 export const RETENTION_EXTENDED_HOURS = 168;
 
 export type PlanTier = "pro" | "trial";
-export type UsageMetric = "edits" | "files" | "recalculations";
+/** Each started 5 MiB of a file counts as one unit. A 25 MiB file counts as 5. */
+export const USAGE_UNIT_BYTES = 5 * 1024 * 1024;
+
+export type UsageMetric = "edits" | "files" | "recalculations" | "proposals";
 
 export type PlanCaps = {
   edits: number;
   files: number;
   recalculations: number;
+  proposals: number;
   maxFileBytes: number;
 };
+
+export function usageUnits(size: number): number {
+  if (!Number.isFinite(size) || size <= 0) return 1;
+  return Math.ceil(size / USAGE_UNIT_BYTES);
+}
 
 export type UsageCounts = Record<UsageMetric, number>;
 
@@ -29,7 +38,8 @@ export function planCaps(tier: PlanTier): PlanCaps {
     return {
       edits: intEnv("STETWISE_CAP_PRO_EDITS", 1000),
       files: intEnv("STETWISE_CAP_PRO_FILES", 250),
-      recalculations: intEnv("STETWISE_CAP_PRO_RECALCS", 200),
+      recalculations: intEnv("STETWISE_CAP_PRO_RECALCS", 100),
+      proposals: intEnv("STETWISE_CAP_PRO_PROPOSALS", 2000),
       maxFileBytes: intEnv("STETWISE_CAP_PRO_MAX_BYTES", DEFAULT_MAX_FILE_BYTES)
     };
   }
@@ -37,6 +47,7 @@ export function planCaps(tier: PlanTier): PlanCaps {
     edits: intEnv("STETWISE_CAP_TRIAL_EDITS", 100),
     files: intEnv("STETWISE_CAP_TRIAL_FILES", 25),
     recalculations: intEnv("STETWISE_CAP_TRIAL_RECALCS", 20),
+    proposals: intEnv("STETWISE_CAP_TRIAL_PROPOSALS", 200),
     maxFileBytes: intEnv("STETWISE_CAP_TRIAL_MAX_BYTES", DEFAULT_MAX_FILE_BYTES)
   };
 }
@@ -53,7 +64,8 @@ export function resetsAt(now = new Date()): string {
 const METRIC_LABEL: Record<UsageMetric, string> = {
   edits: "applied edits",
   files: "files",
-  recalculations: "recalculations"
+  recalculations: "recalculations",
+  proposals: "proposals"
 };
 
 export class QuotaError extends ToolError {
@@ -62,10 +74,12 @@ export class QuotaError extends ToolError {
     readonly used: number,
     readonly cap: number,
     readonly tier: PlanTier,
-    now = new Date()
+    now = new Date(),
+    readonly units = 1
   ) {
+    const weight = units > 1 ? ` This request counts as ${units}.` : "";
     super(
-      `Monthly ${METRIC_LABEL[metric]} cap reached (${used} of ${cap} on the ${tier} plan). This request was blocked. Stetwise does not bill overage. Usage resets ${resetsAt(now)}.`,
+      `Monthly ${METRIC_LABEL[metric]} cap reached (${used} of ${cap} on the ${tier} plan).${weight} This request was blocked. Stetwise does not bill overage. Usage resets ${resetsAt(now)}.`,
       "usage_cap"
     );
     this.name = "QuotaError";
@@ -102,7 +116,7 @@ export function expiryFrom(lastUsedAt: string, hours: number): string {
 }
 
 export function emptyUsage(): UsageCounts {
-  return { edits: 0, files: 0, recalculations: 0 };
+  return { edits: 0, files: 0, recalculations: 0, proposals: 0 };
 }
 
 export function usageView(tier: PlanTier, counts: UsageCounts, retentionHours: number, now = new Date()) {
@@ -120,6 +134,7 @@ export function usageView(tier: PlanTier, counts: UsageCounts, retentionHours: n
     edits: metric("edits"),
     files: metric("files"),
     recalculations: metric("recalculations"),
+    proposals: metric("proposals"),
     resets_at: resetsAt(now),
     overage_billing: false
   };

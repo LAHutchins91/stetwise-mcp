@@ -12,7 +12,7 @@ export function installPublicPages(app: Express) {
       page(
         "Stetwise access",
         `<p>Editing tools are available during the 14-day trial and on Pro. This connection does not have that access. It cannot start a purchase or add an overage charge.</p>
-<p>Trial accounts can apply 100 edits and 20 recalculations per UTC month, and store 25 new files. Pro accounts can apply 1,000 edits, store 250 new files, and run 200 recalculations. Each file must be at most 25 MB (26,214,400 bytes). Past a cap, Stetwise blocks the call. Nothing extra is billed.</p>
+<p>Trial accounts can apply 100 edits, save 200 proposals, and run 20 recalculations per UTC month, and store 25 new files. Pro accounts can apply 1,000 edits, save 2,000 proposals, store 250 new files, and run 100 recalculations. Each started 5 MB of a file counts as one unit. Each file must be at most 25 MB (26,214,400 bytes). Past a cap, Stetwise blocks the call. Nothing extra is billed.</p>
 <p><a href="/connections">Manage the connection</a> or <a href="/support">contact support</a> if this looks wrong.</p>`
       )
     )
@@ -33,7 +33,7 @@ export function installPublicPages(app: Express) {
 <h2>Subprocessors</h2>
 <p>Supabase provides sign-in and, when configured, the database. Vercel may host the MCP and account pages. The engine host runs the file editor. Stripe processes payment. Google provides optional sign-in. We do not store complete card numbers.</p>
 <h2>Caps</h2>
-<p>Monthly caps limit applied edits, new files, and recalculations. Stetwise does not bill overage. A refused call is the whole response.</p>`
+<p>Monthly caps limit applied edits, new files, proposals, and recalculations. Each started 5 MB counts as one unit. Stetwise does not bill overage. A refused call is the whole response.</p>`
       )
     )
   );

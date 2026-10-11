@@ -228,6 +228,37 @@ describe("MCP", () => {
     delete process.env.STETWISE_CAP_TRIAL_RECALCS;
   });
 
+  it("counts a recalculation when LibreOffice starts and leaves no soffice behind", async () => {
+    const store = getStore();
+    await store.replaceUsage(DEV_USER_ID, { recalculations: 0, proposals: 0 });
+    const original = fs.readFileSync(path.join(repoRoot(), "tests/fixtures/generated/model.xlsx"));
+    const fileId = await upload("model.xlsx", original);
+    process.env.STETWISE_RECALC_TIMEOUT = "1";
+    process.env.STETWISE_RECALC_HOLD = "12";
+    try {
+      const failed = await call("recalculate", { file_id: fileId });
+      expect(failed.isError).toBe(true);
+      expect(JSON.stringify(failed.data)).toContain("recalc_failed");
+      const usage = await call("get_usage", {});
+      expect((usage.data.recalculations as { used: number }).used).toBe(1);
+    } finally {
+      delete process.env.STETWISE_RECALC_TIMEOUT;
+      delete process.env.STETWISE_RECALC_HOLD;
+    }
+    const deadline = Date.now() + 5000;
+    let left = "stetwise-lo-";
+    while (Date.now() < deadline) {
+      const listing = execFileSync("ps", ["-eo", "args"], { encoding: "utf8" });
+      left = listing
+        .split("\n")
+        .filter((line) => line.includes("stetwise-lo-"))
+        .join("\n");
+      if (!left) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(left).toBe("");
+  });
+
   it("creates a blank workbook and fills it through propose and apply", async () => {
     const created = await call("create_file", { kind: "xlsx", filename: "notes.xlsx" });
     expect(created.isError, created.text).toBe(false);

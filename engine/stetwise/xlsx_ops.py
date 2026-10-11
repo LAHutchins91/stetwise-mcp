@@ -246,12 +246,29 @@ def format_cells(package: Package, sheet_name: str, refs: list[str], options: di
     number_format = options.get("number_format")
     horizontal = options.get("horizontal")
     width = options.get("column_width")
-    if not any(item is not None for item in (bold, italic, fill, number_format, horizontal, width)):
-        raise StetwiseRefusal("format_cells needs a number format, bold, italic, fill, alignment, or column width.", "empty_edit")
+    font_size = options.get("font_size")
+    font_color = options.get("font_color")
+    border = options.get("border")
+    if font_size is not None:
+        try:
+            font_size = float(font_size)
+        except (TypeError, ValueError):
+            font_size = -1
+        if not (font_size > 0 and font_size <= 409):
+            raise StetwiseRefusal("Font size must be greater than 0 and at most 409.", "bad_format")
+    if font_color is not None and not re.fullmatch(r"[0-9A-Fa-f]{6}", str(font_color)):
+        raise StetwiseRefusal("Font colour must be six hex digits, RRGGBB.", "bad_format")
+    if border is not None and border is not True:
+        raise StetwiseRefusal("border must be true to add a thin black outline.", "bad_format")
+    if not any(item is not None for item in (bold, italic, fill, number_format, horizontal, width, font_size, font_color, border)):
+        raise StetwiseRefusal(
+            "format_cells needs a number format, bold, italic, fill, alignment, column width, font size, font colour, or a border.",
+            "empty_edit",
+        )
     if not refs:
         raise StetwiseRefusal("format_cells needs at least one cell.", "empty_edit")
-    if len(refs) > 500:
-        raise StetwiseRefusal("v1 formats at most 500 cells in one edit.", "too_many")
+    if len(refs) > 5000:
+        raise StetwiseRefusal("v1 formats at most 5000 cells in one edit.", "too_many")
     if fill is not None and not re.fullmatch(r"[0-9A-Fa-f]{6}", str(fill)):
         raise StetwiseRefusal("Fill must be six hex digits, RRGGBB.", "bad_format")
     if horizontal is not None and horizontal not in {"left", "center", "right"}:
@@ -279,9 +296,21 @@ def format_cells(package: Package, sheet_name: str, refs: list[str], options: di
     cache: dict[tuple, int] = {}
     for ref in normalized:
         index = _style_index(xml, ref)
-        key = (index, bold, italic, str(fill).upper() if fill else None, number_format, horizontal)
+        key = (
+            index,
+            bold,
+            italic,
+            str(fill).upper() if fill else None,
+            number_format,
+            horizontal,
+            font_size,
+            str(font_color).upper() if font_color else None,
+            border is True,
+        )
         if key not in cache:
-            style_xml, new_index = _append_style(style_xml, index, bold, italic, fill, number_format, horizontal)
+            style_xml, new_index = _append_style(
+                style_xml, index, bold, italic, fill, number_format, horizontal, font_size, font_color, border is True
+            )
             cache[key] = new_index
         xml = _set_style_attr(xml, ref, cache[key])
         changes.append({"ref": ref, "style_index": cache[key]})
@@ -391,7 +420,24 @@ def _append_child(xml: bytes, tag: str, child: bytes) -> bytes:
     return xml[:open_at] + new_open + xml[inner_at:close_at] + child + xml[close_at:]
 
 
-def _append_style(xml: bytes, index: int, bold, italic, fill, number_format, horizontal) -> tuple[bytes, int]:
+_THIN_BORDER = (
+    b'<border><left style="thin"><color rgb="FF000000"/></left>'
+    b'<right style="thin"><color rgb="FF000000"/></right>'
+    b'<top style="thin"><color rgb="FF000000"/></top>'
+    b'<bottom style="thin"><color rgb="FF000000"/></bottom>'
+    b"<diagonal/></border>"
+)
+
+
+def _size_text(size: float) -> str:
+    if float(size).is_integer():
+        return str(int(size))
+    return format(size, ".2f").rstrip("0").rstrip(".")
+
+
+def _append_style(
+    xml: bytes, index: int, bold, italic, fill, number_format, horizontal, font_size=None, font_color=None, border=False
+) -> tuple[bytes, int]:
     from .xlsx import BUILTIN_FMT
 
     _open, inner_at, close_at = _parent(xml, "cellXfs")
@@ -402,14 +448,21 @@ def _append_style(xml: bytes, index: int, bold, italic, fill, number_format, hor
     font_id = _attr(xf, "fontId") or "0"
     fill_id = _attr(xf, "fillId") or "0"
     num_id = _attr(xf, "numFmtId") or "0"
-    if bold is not None or italic is not None:
+    border_id = None
+    font_changed = bold is not None or italic is not None or font_size is not None or font_color is not None
+    if font_changed:
         fonts_open, fonts_inner, fonts_close = _parent(xml, "fonts")
         fonts = _children(xml[fonts_inner:fonts_close], "font")
         if int(font_id) >= len(fonts):
             raise StetwiseRefusal("The cell's font record is missing.", "unsafe_style")
-        font = _font_with(fonts[int(font_id)], bold, italic)
+        font = _font_with(fonts[int(font_id)], bold, italic, font_size, font_color)
         xml = _append_child(xml, "fonts", font)
         font_id = str(len(fonts))
+    if border:
+        _bo, borders_inner, borders_close = _parent(xml, "borders")
+        borders = _children(xml[borders_inner:borders_close], "border")
+        xml = _append_child(xml, "borders", _THIN_BORDER)
+        border_id = str(len(borders))
     if fill:
         paint = (
             f'<fill><patternFill patternType="solid"><fgColor rgb="FF{fill.upper()}"/>'
@@ -434,7 +487,17 @@ def _append_style(xml: bytes, index: int, bold, italic, fill, number_format, hor
                 xml = xml[:fonts_at] + b'<numFmts count="1">' + record + b"</numFmts>" + xml[fonts_at:]
             else:
                 xml = _append_child(xml, "numFmts", record)
-    xf_xml = _xf_with(xf, font_id, fill_id, num_id, horizontal, number_format is not None, bold is not None or italic is not None, fill is not None)
+    xf_xml = _xf_with(
+        xf,
+        font_id,
+        fill_id,
+        num_id,
+        horizontal,
+        number_format is not None,
+        font_changed,
+        fill is not None,
+        border_id,
+    )
     _xo, x_inner, x_close = _parent(xml, "cellXfs")
     count = len(_children(xml[x_inner:x_close], "xf"))
     xml = _append_child(xml, "cellXfs", xf_xml)
@@ -448,7 +511,7 @@ def _attr(tag: bytes, name: str) -> str | None:
     return match.group(1).decode("utf-8")
 
 
-def _font_with(font: bytes, bold, italic) -> bytes:
+def _font_with(font: bytes, bold, italic, size=None, color=None) -> bytes:
     if font.endswith(b"/>"):
         inner = b""
         body = b"<font>"
@@ -469,6 +532,14 @@ def _font_with(font: bytes, bold, italic) -> bytes:
         prefix += b"<i/>"
     elif italic is False:
         prefix += b'<i val="0"/>'
+    if size is not None:
+        inner = re.sub(br"<sz\b[^>]*/>", b"", inner)
+        inner = re.sub(br"<sz\b[^>]*>.*?</sz>", b"", inner, flags=re.DOTALL)
+        prefix += f'<sz val="{_size_text(float(size))}"/>'.encode()
+    if color is not None:
+        inner = re.sub(br"<color\b[^>]*/>", b"", inner)
+        inner = re.sub(br"<color\b[^>]*>.*?</color>", b"", inner, flags=re.DOTALL)
+        prefix += f'<color rgb="FF{str(color).upper()}"/>'.encode()
     return body + prefix + inner + end
 
 
@@ -477,7 +548,17 @@ def _next_num_fmt(xml: bytes) -> int:
     return max([164, *ids]) + 1 if ids else 164
 
 
-def _xf_with(xf: bytes, font_id: str, fill_id: str, num_id: str, horizontal, number: bool, font: bool, fill: bool) -> bytes:
+def _xf_with(
+    xf: bytes,
+    font_id: str,
+    fill_id: str,
+    num_id: str,
+    horizontal,
+    number: bool,
+    font: bool,
+    fill: bool,
+    border_id: str | None = None,
+) -> bytes:
     self_close = xf.endswith(b"/>")
     if self_close:
         head = xf[:-2].rstrip()
@@ -497,6 +578,9 @@ def _xf_with(xf: bytes, font_id: str, fill_id: str, num_id: str, horizontal, num
         head = _replace_attr(head, "applyFont", "1")
     if fill:
         head = _replace_attr(head, "applyFill", "1")
+    if border_id is not None:
+        head = _replace_attr(head, "borderId", border_id)
+        head = _replace_attr(head, "applyBorder", "1")
     if horizontal:
         head = _replace_attr(head, "applyAlignment", "1")
         align = f'<alignment horizontal="{horizontal}"/>'.encode()

@@ -53,3 +53,18 @@ CPU seconds are `time.process_time` inside the worker, after imports. Peak memor
 | large-25mb | docx | 26214436 | restore | yes | 0.0269 | 50.0 | 0.0878 |
 
 Every measured operation completed.
+
+## Recalculate
+
+Formula workbooks are ZIP_STORED. Each cell is `ROW()` plus a few zero terms, ten columns wide, with no cached value. `recalculate` starts LibreOffice, reads formula results in bulk, and patches cached values in one pass. The product time limit stays 60 seconds.
+
+CPU seconds are the process tree (the worker plus LibreOffice) sampled while the call runs. Peak MiB is the highest resident set of that tree at one sample. Wall seconds include LibreOffice startup, calculation, and the XML patch.
+
+| Sample | Bytes | Formulas | OK | CPU seconds | Peak MiB | Wall seconds |
+|---|---:|---:|---|---:|---:|---:|
+| small | 97646 | 1280 | yes | 0.6600 | 225.6 | 1.0137 |
+| medium | 2026825 | 26790 | yes | 1.5300 | 277.6 | 1.7233 |
+| large-5mb | 5083545 | 67010 | yes | 2.4600 | 308.3 | 2.5387 |
+| large-25mb | 25723945 | 335190 | yes | 12.1800 | 858.4 | 10.4446 |
+
+Every recalculation finished inside the product time limit.

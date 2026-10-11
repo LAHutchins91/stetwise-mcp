@@ -332,13 +332,45 @@ def _unsafe_paragraph(paragraph) -> None:
             )
 
 
-def insert_paragraph(package, anchor: str, text: str, track_changes: bool = False):
+def _paragraph_style_defined(package, style_id: str) -> bool:
+    styles = package.parts().get("word/styles.xml")
+    if not styles or any(ch in style_id for ch in '<>&"'):
+        return False
+    token = re.escape(style_id.encode("utf-8"))
+    pattern = (
+        br'<w:style\b[^>]*w:type="paragraph"[^>]*w:styleId="' + token + br'"'
+        br'|<w:style\b[^>]*w:styleId="' + token + br'"[^>]*w:type="paragraph"'
+    )
+    return re.search(pattern, styles) is not None
+
+
+def _pstyle(ppr: bytes | None, style_id: str) -> bytes:
+    from .xmlutil import xml_escape
+
+    tag = f'<w:pStyle w:val="{xml_escape(style_id)}"/>'.encode("utf-8")
+    if not ppr:
+        return b"<w:pPr>" + tag + b"</w:pPr>"
+    if re.search(br"<w:pStyle\b", ppr):
+        replaced = re.sub(br"<w:pStyle\b[^>]*/>", tag, ppr, count=1)
+        if replaced == ppr:
+            replaced = re.sub(br"<w:pStyle\b[^>]*>.*?</w:pStyle>", tag, ppr, count=1, flags=re.DOTALL)
+        return replaced
+    gt = ppr.find(b">")
+    return ppr[: gt + 1] + tag + ppr[gt + 1 :]
+
+
+def insert_paragraph(package, anchor: str, text: str, track_changes: bool = False, style: str | None = None):
     from .docx import EditResult, _document, _paragraphs, _style_of, protected, tracking_on
     from .xmlutil import parse_xml
 
     if protected(package):
         raise StetwiseRefusal("This document is protected. v1 will not bypass document protection.", "protected")
     reject_controls(text, "Paragraph text")
+    if style is not None and not _paragraph_style_defined(package, str(style)):
+        raise StetwiseRefusal(
+            f"Paragraph style {style!r} is not already defined in this document. v1 will not create or edit styles.",
+            "unknown_style",
+        )
     xml = _document(package)
     root = parse_xml(xml, "word/document.xml")
     number, (start, end) = _paragraph(xml, anchor)
@@ -346,18 +378,28 @@ def insert_paragraph(package, anchor: str, text: str, track_changes: bool = Fals
     para = xml[start:end]
     ppr = re.search(br"<w:pPr\b[^>]*>.*?</w:pPr>|<w:pPr\b[^>]*/>", para, re.DOTALL)
     rpr = re.search(br"<w:rPr\b[^>]*>.*?</w:rPr>|<w:rPr\b[^>]*/>", para, re.DOTALL)
+    ppr_bytes = ppr.group(0) if ppr else b""
+    chosen = _style_of(paragraph)
+    if style is not None:
+        ppr_bytes = _pstyle(ppr_bytes or None, str(style))
+        chosen = str(style)
     tracked = track_changes or tracking_on(package)
     run = _plain_run(rpr.group(0) if rpr else b"", text)
     if tracked:
         run = _wrap("w:ins", _Ids(xml).next(), rpr.group(0) if rpr else b"", text, "w:t", _date())
-    built = b"<w:p>" + (ppr.group(0) if ppr else b"") + run + b"</w:p>"
+    built = b"<w:p>" + ppr_bytes + run + b"</w:p>"
     out = xml[:end] + built + xml[end:]
     parts = {"word/document.xml": out}
     parts.update(_settings_on(package, track_changes))
+    warning = (
+        "The new paragraph uses a paragraph style already defined in the document. styles.xml was not changed."
+        if style is not None
+        else "The new paragraph copies the anchor paragraph's style and the first run's formatting."
+    )
     return EditResult(
         replacements=parts,
-        diff=[{"op": "insert_paragraph", "anchor": anchor, "after": f"p-{number + 1}", "text": text, "style": _style_of(paragraph), "tracked": tracked}],
-        warnings=["The new paragraph copies the anchor paragraph's style and the first run's formatting."],
+        diff=[{"op": "insert_paragraph", "anchor": anchor, "after": f"p-{number + 1}", "text": text, "style": chosen, "tracked": tracked}],
+        warnings=[warning],
     )
 
 
